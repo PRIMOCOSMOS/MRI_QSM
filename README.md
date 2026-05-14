@@ -4,6 +4,7 @@
 ```
 D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge\
 ├── main_qsm_pipeline.m
+├── run_xqsm_bridge_smoketest.m % xQSM Python 桥接测试脚本
 ├── config/
 │   └── pipeline_config.m
 ├── modules/
@@ -26,9 +27,7 @@ D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge\
 │   ├── lambda_to_tag.m
 │   └── print_volume_summary.m
 ├── models/                              % 预训练模型权重
-│   ├── QSMnet_plus.onnx
-│   ├── xQSM.onnx
-│   └── README.md
+│   └── xQSM_invivo.pth
 ├── output/
 │   ├── results/
 │   └── figures/
