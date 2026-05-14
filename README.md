@@ -1,5 +1,7 @@
 ### Project Summary
 ---
+
+```
 D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge\
 ├── main_qsm_pipeline.m
 ├── config/
@@ -31,5 +33,7 @@ D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge\
 │   ├── results/
 │   └── figures/
 └── data/
+```
+
 ---
 
