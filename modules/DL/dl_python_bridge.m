@@ -1,171 +1,199 @@
 function chi = dl_python_bridge(model_name, input_norm, Mask, N, ~, norm_factor, cfg)
 % dl_python_bridge.m
-% 通过 MATLAB-Python 接口调用 PyTorch 深度学习模型
+% MATLAB -> Python 桥接（xQSM .pth）
 %
-% 支持模型: 'qsmnet_plus', 'xqsm'
-%
-% 前提条件:
-%   1. MATLAB 已配置 Python 环境 (pyenv)
-%   2. Python 环境中安装了 torch, numpy
-%   3. 模型权重文件 (.pth) 位于 cfg.dlModelDir
-%
-% 调用流程:
-%   MATLAB -> numpy array -> Python inference script -> numpy array -> MATLAB
+% 本版本要点:
+% 1) 不再依赖 PATH 中必须有 python
+% 2) 自动优先使用 cfg.deeplearning.python_executable
+% 3) 再尝试 pyenv.Executable
+% 4) 再尝试 where python
+% 5) 若仍失败，抛出可操作错误信息
 
 chi = [];
 
-%% 检查 Python 环境
+if ~strcmpi(model_name, 'xqsm')
+    error('dl_python_bridge 当前仅支持 model_name = ''xqsm''。');
+end
+
+if ~isfield(cfg, 'deeplearning')
+    error('cfg.deeplearning 不存在。');
+end
+
+% -------------------------------------------------------------------------
+% 1) 配置校验
+% -------------------------------------------------------------------------
+required_fields = {'xqsm_pth', 'xqsm_repo_root', 'xqsm_bridge_script'};
+for i = 1:numel(required_fields)
+    f = required_fields{i};
+    if ~isfield(cfg.deeplearning, f) || isempty(cfg.deeplearning.(f))
+        error('cfg.deeplearning.%s 未配置。', f);
+    end
+end
+
+ckpt_path = cfg.deeplearning.xqsm_pth;
+xqsm_repo_root = cfg.deeplearning.xqsm_repo_root;
+script_path = cfg.deeplearning.xqsm_bridge_script;
+
+if exist(ckpt_path, 'file') ~= 2
+    error('未找到 xQSM checkpoint: %s', ckpt_path);
+end
+if exist(xqsm_repo_root, 'dir') ~= 7
+    error('未找到 xQSM repo 根目录: %s', xqsm_repo_root);
+end
+if exist(script_path, 'file') ~= 2
+    error('未找到 xQSM bridge 脚本: %s', script_path);
+end
+
+xqsm_py_file = fullfile(xqsm_repo_root, 'python', 'xQSM.py');
+if exist(xqsm_py_file, 'file') ~= 2
+    error('xQSM.py 不存在: %s', xqsm_py_file);
+end
+
+device_mode = 'auto';
+if isfield(cfg.deeplearning, 'xqsm_device') && ~isempty(cfg.deeplearning.xqsm_device)
+    device_mode = lower(char(cfg.deeplearning.xqsm_device));
+end
+
+% -------------------------------------------------------------------------
+% 2) Python 可执行文件解析（修复 9009）
+% -------------------------------------------------------------------------
+python_exe = resolve_python_executable(cfg);
+
+fprintf('  Python executable:\n    %s\n', python_exe);
+
+% -------------------------------------------------------------------------
+% 3) 写入输入
+% -------------------------------------------------------------------------
+input_mat = fullfile(cfg.resultDir, 'temp_xqsm_input.mat');
+output_mat = fullfile(cfg.resultDir, 'temp_xqsm_output.mat');
+
+if exist(output_mat, 'file') == 2
+    delete(output_mat);
+end
+
+save(input_mat, 'input_norm', 'Mask', 'N', 'norm_factor', '-v7');
+
+% -------------------------------------------------------------------------
+% 4) 调用独立脚本
+% -------------------------------------------------------------------------
+cmd = sprintf('"%s" "%s" --input_mat "%s" --output_mat "%s" --checkpoint "%s" --xqsm_root "%s" --device "%s"', ...
+    python_exe, script_path, input_mat, output_mat, ckpt_path, xqsm_repo_root, device_mode);
+
+fprintf('  Python bridge 命令:\n    %s\n', cmd);
+
+[status, result] = system(cmd);
+fprintf('%s\n', result);
+
+if status ~= 0
+    cleanup_temp_files(input_mat, output_mat);
+    if status == 9009
+        error(['Python 推理失败，退出码=9009（命令未找到）。' newline ...
+               '请在 pipeline_config.m 设置:' newline ...
+               'cfg.deeplearning.python_executable = ''C:\path\to\python.exe'';']);
+    else
+        error('Python 推理失败，退出码=%d。', status);
+    end
+end
+
+if exist(output_mat, 'file') ~= 2
+    cleanup_temp_files(input_mat, output_mat);
+    error('Python 推理完成但未生成输出文件: %s', output_mat);
+end
+
+S = load(output_mat);
+if ~isfield(S, 'chi')
+    cleanup_temp_files(input_mat, output_mat);
+    error('输出 mat 中未找到变量 chi。');
+end
+
+chi = double(S.chi);
+
+if ~isequal(size(chi), N)
+    cleanup_temp_files(input_mat, output_mat);
+    error('xQSM 输出尺寸不匹配，期望 [%d %d %d]，实际 [%d %d %d]。', ...
+        N(1), N(2), N(3), size(chi,1), size(chi,2), size(chi,3));
+end
+
+chi(~Mask) = 0;
+
+cleanup_temp_files(input_mat, output_mat);
+
+end
+
+%% =========================================================================
+function python_exe = resolve_python_executable(cfg)
+% 解析可用 python.exe 路径
+
+python_exe = '';
+
+% A) 配置显式指定（最高优先级）
+if isfield(cfg.deeplearning, 'python_executable') && ~isempty(cfg.deeplearning.python_executable)
+    candidate = char(cfg.deeplearning.python_executable);
+    if exist(candidate, 'file') == 2
+        python_exe = candidate;
+        return;
+    else
+        warning('配置的 python_executable 不存在: %s', candidate);
+    end
+end
+
+% B) MATLAB pyenv
 try
     pe = pyenv;
-    if pe.Status ~= "Loaded" && isempty(pe.Executable)
-        fprintf('  Python 环境未配置，跳过 %s\n', model_name);
+    if ~isempty(pe.Executable) && exist(char(pe.Executable), 'file') == 2
+        python_exe = char(pe.Executable);
         return;
     end
 catch
-    fprintf('  pyenv 不可用，跳过 Python bridge\n');
-    return;
 end
 
-%% 检查 torch 可用性
-try
-    py.importlib.import_module('torch');
-catch
-    fprintf('  Python torch 不可用，跳过 %s\n', model_name);
-    fprintf('  请在 Python 环境中安装: pip install torch\n');
-    return;
-end
-
-%% 准备推理脚本路径
-script_dir = fullfile(cfg.dlModelDir, 'python_scripts');
-if ~exist(script_dir, 'dir')
-    mkdir(script_dir);
-end
-
-% 生成推理脚本
-script_path = fullfile(script_dir, sprintf('infer_%s.py', model_name));
-generate_inference_script(script_path, model_name, cfg);
-
-%% 保存输入数据为临时 .npy
-temp_input = fullfile(cfg.resultDir, 'temp_dl_input.mat');
-temp_output = fullfile(cfg.resultDir, 'temp_dl_output.mat');
-
-save(temp_input, 'input_norm', 'Mask', 'N', 'norm_factor', '-v7');
-
-%% 调用 Python
-fprintf('  调用 Python 推理: %s\n', model_name);
-
-try
-    py.runfile(script_path, pyargs( ...
-        'input_path', temp_input, ...
-        'output_path', temp_output, ...
-        'model_dir', cfg.dlModelDir));
-catch ME
-    % 备选: 使用 system 调用
-    cmd = sprintf('"%s" "%s" --input "%s" --output "%s" --model_dir "%s"', ...
-        char(pe.Executable), script_path, temp_input, temp_output, cfg.dlModelDir);
-    [status, result] = system(cmd);
-    
-    if status ~= 0
-        fprintf('  Python 调用失败: %s\n', result);
-        cleanup_temp(temp_input, temp_output);
-        return;
+% C) Windows where python
+if ispc
+    [st, out] = system('where python');
+    if st == 0
+        lines = regexp(strtrim(out), '\r?\n', 'split');
+        for i = 1:numel(lines)
+            p = strtrim(lines{i});
+            if ~isempty(p) && exist(p, 'file') == 2
+                python_exe = p;
+                return;
+            end
+        end
+    end
+else
+    % Linux/macOS
+    [st, out] = system('which python3');
+    if st == 0
+        p = strtrim(out);
+        if exist(p, 'file') == 2
+            python_exe = p;
+            return;
+        end
+    end
+    [st, out] = system('which python');
+    if st == 0
+        p = strtrim(out);
+        if exist(p, 'file') == 2
+            python_exe = p;
+            return;
+        end
     end
 end
 
-%% 加载结果
-if exist(temp_output, 'file')
-    S = load(temp_output);
-    if isfield(S, 'chi')
-        chi = double(S.chi);
-        chi = chi .* Mask;
-        fprintf('  Python bridge 推理成功: %s\n', model_name);
-    end
-end
-
-%% 清理临时文件
-cleanup_temp(temp_input, temp_output);
-
+error(['未找到可用 Python 可执行文件。' newline ...
+       '请在 config/pipeline_config.m 设置:' newline ...
+       'cfg.deeplearning.python_executable = ''C:\path\to\python.exe'';']);
 end
 
 %% =========================================================================
-function cleanup_temp(varargin)
+function cleanup_temp_files(varargin)
 for i = 1:numel(varargin)
-    if exist(varargin{i}, 'file')
-        delete(varargin{i});
+    f = varargin{i};
+    if exist(f, 'file') == 2
+        try
+            delete(f);
+        catch
+        end
     end
 end
-
-end
-
-%% =========================================================================
-function generate_inference_script(script_path, model_name, ~)
-% 生成 Python 推理脚本
-
-fid = fopen(script_path, 'w');
-if fid == -1
-    return;
-end
-
-fprintf(fid, '#!/usr/bin/env python3');
-fprintf(fid, '"""Auto-generated inference script for %s"""', model_name);
-fprintf(fid, 'import sys, os');
-fprintf(fid, 'import numpy as np');
-fprintf(fid, 'import scipy.io as sio');
-fprintf(fid, 'import torch');
-fprintf(fid, 'import torch.nn as nn');
-
-fprintf(fid, 'def main(input_path, output_path, model_dir):');
-fprintf(fid, '    # Load input');
-fprintf(fid, '    data = sio.loadmat(input_path)');
-fprintf(fid, '    input_norm = data["input_norm"].astype(np.float32)');
-fprintf(fid, '    mask = data["Mask"].astype(bool)');
-fprintf(fid, '    norm_factor = float(data["norm_factor"])');
-
-fprintf(fid, '    # Load model');
-fprintf(fid, '    model_path = os.path.join(model_dir, "%s.pth")', model_name);
-fprintf(fid, '    if not os.path.exists(model_path):');
-fprintf(fid, '        print(f"Model not found: {model_path}")');
-fprintf(fid, '        return');
-
-fprintf(fid, '    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")');
-fprintf(fid, '    model = torch.load(model_path, map_location=device)');
-fprintf(fid, '    model.eval()');
-
-fprintf(fid, '    # Patch-based inference');
-fprintf(fid, '    patch_size = 64');
-fprintf(fid, '    stride = 32');
-fprintf(fid, '    N = input_norm.shape');
-fprintf(fid, '    chi = np.zeros(N, dtype=np.float32)');
-fprintf(fid, ' np.zeros(N, dtype=np.float32)');
-
-fprintf(fid, '    with torch.no_grad():');
-fprintf(fid, '        for i in range(0, N[0]-patch_size+1, stride):');
-fprintf(fid, '            for j in range(0, N[1]-patch_size+1, stride):');
-fprintf(fid, '                for k in range(0, N[2]-patch_size+1, stride):');
-fprintf(fid, '                    patch = input_norm[i:i+patch_size, j:j+patch_size, k:k+patch_size]');
-fprintf(fid, '                    if np.max(np.abs(patch)) < 1e-6:');
-fprintf(fid, '                        continue');
-fprintf(fid, '                    x = torch.from_numpy(patch[None, None]).to(device)');
-fprintf(fid, '                    y = model(x).cpu().numpy()[0, 0]');
-fprintf(fid, '                    chi[i:i+patch_size, j:j+patch_size, k:k+patch_size] += y');
-fprintf(fid, '                    weight[i:i+patch_size, j:j+patch_size, k:k+patch_size] += 1');
-
-fprintf(fid, '    weight[weight < 1] = 1');
-fprintf(fid, '    chi = chi / weight * norm_factor');
-fprintf(fid, '    chi[~mask] = 0');
-
-fprintf(fid, '    sio.savemat(output_path, {"chi": chi})');
-fprintf(fid, '    print("Inference complete")');
-
-fprintf(fid, 'if __name__ == "__main__":');
-fprintf(fid, '    import argparse');
-fprintf(fid, '    parser = argparse.ArgumentParser()');
-fprintf(fid, '    parser.add_argument("--input", required=True)');
-fprintf(fid, '    parser.add_argument("--output", required=True)');
-fprintf(fid, '    parser.add_argument("--model_dir", required=True)');
-fprintf(fid, '    args = parser.parse_args()');
-fprintf(fid, '    main(args.input, args.output, args.model_dir)');
-
-fclose(fid);
-
 end
