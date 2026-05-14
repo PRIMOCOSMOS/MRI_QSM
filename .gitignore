@@ -1,0 +1,58 @@
+# MATLAB 自动生成的文件
+*.asv               
+*.autosave          
+*.m~                
+
+# MATLAB 编译和缓存文件
+*.mex*              
+*.p                
+*.slx.autosave    
+*.slxc              
+slprj/              
+*.slx.original      
+
+# MATLAB 代码生成
+codegen/          
+sfunction/         
+
+# MATLAB 输出文件
+*.mat               
+*.fig              
+
+# 项目相关文件夹
+data/               
+data_12orientations/   
+output_MEDI/        
+output_modular_pipeline/   
+output_QSM2016_MEDI_complete/    
+utils/             
+results/           
+temp/             
+cache/              
+
+# MATLAB App Designer
+*.mlapp.autosave   
+
+# 日志和报告
+*.log               
+*.txt              
+report/             
+
+# 操作系统文件
+.DS_Store         
+Thumbs.db         
+desktop.ini      
+*~                  
+
+# IDE 相关
+.vscode/            
+.idea/            
+*.sublime-*         
+
+# 其他
+*.bin
+*.zip
+*.rar
+*.tar.gz
+old/               
+backup/             
