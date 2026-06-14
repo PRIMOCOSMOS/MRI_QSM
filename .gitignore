@@ -22,6 +22,7 @@ sfunction/
 # 项目相关文件夹
 data/               
 data_12orientations/   
+data_course/
 output_MEDI/        
 output_modular_pipeline/   
 output_QSM2016_MEDI_complete/    
