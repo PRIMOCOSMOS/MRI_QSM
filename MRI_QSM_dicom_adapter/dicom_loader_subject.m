@@ -1,275 +1,253 @@
-function data = dicom_loader_subject(subject, output_data_dir)
-% dicom_loader_subject.m  (v3 - 防御性 + 调试版)
+function data = dicom_loader_subject(subject, output_data_dir, varargin)
+% dicom_loader_subject.m  (v4 - WH-QSM real-data loader)
 % ============================================================================
-%   加载单个被试的 Siemens SWI DICOM 数据
-%   每个步骤都有详细的进度输出和错误捕获
+% Load one Siemens SWI DICOM subject and prepare the minimum reliable input
+% needed by WH-QSM:
+%   - magnitude image and brain mask
+%   - multi-echo phase -> field map in Hz via echo-time fitting
+%   - ppm compatibility field for older code paths
+%   - actual DICOM echo times / delta_TE / B0 passed downstream
+%
+% Key v4 changes:
+%   1) Two-echo phase is no longer reduced to "last echo".
+%      We convert Siemens phase units to radians for each echo, unwrap along
+%      echo dimension, and fit phase(TE) slope to obtain fieldmap_Hz.
+%   2) If only one echo is present, fallback is explicit and documented:
+%      fieldmap_Hz = phase_rad / (2*pi*TE).
+%   3) EchoTime, delta_TE, B0, voxel size, and phase-conversion metadata are
+%      stored in data and later written into the SEPIA header.
+%   4) qsm2016_format output now saves individual variables plus data_full.mat
+%      instead of a misleading phs_tissue.mat containing only variable "data".
 % ============================================================================
 
 if nargin < 2 || isempty(output_data_dir)
     output_data_dir = fullfile(subject.path, '_qsm2016_format');
 end
 
+p = inputParser;
+addParameter(p, 'mask_method', 'auto', @(x) ischar(x) || isstring(x));
+addParameter(p, 'mask_erode_mm', 1.5, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x >= 0);
+addParameter(p, 'mask_threshold_factor', 0.12, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x < 1);
+addParameter(p, 'bet_fractional_threshold', 0.50, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x < 1);
+addParameter(p, 'bet_vertical_gradient', 0.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
+parse(p, varargin{:});
+mask_method = char(p.Results.mask_method);
+mask_erode_mm = p.Results.mask_erode_mm;
+mask_threshold_factor = p.Results.mask_threshold_factor;
+bet_fractional_threshold = p.Results.bet_fractional_threshold;
+bet_vertical_gradient = p.Results.bet_vertical_gradient;
+
+if ~exist(output_data_dir, 'dir')
+    mkdir(output_data_dir);
+end
+
 fprintf('\n');
 fprintf('============================================================\n');
-fprintf(' DICOM 加载器 v3 - 被试: %s (%s)\n', subject.name, upper(subject.group));
-fprintf(' 路径: %s\n', subject.path);
+fprintf(' DICOM loader v4 - subject: %s (%s)\n', subject.name, upper(subject.group));
+fprintf(' Path: %s\n', subject.path);
+fprintf(' Mask method: %s, erosion: %.3g mm, threshold factor: %.3g\n', mask_method, mask_erode_mm, mask_threshold_factor);
 fprintf('============================================================\n\n');
 
-if ~exist(output_data_dir, 'dir'), mkdir(output_data_dir); end
-
-% ====== Step 1: 扫描所有 DICOM ======
-fprintf('[Step 1/6] 扫描 DICOM...\n');
-try
-    file_list = discover_all_dicom(subject.path);
-    fprintf('  ✅ 发现 %d 个 DICOM\n', length(file_list));
-catch ME
-    fprintf('  ❌ 扫描失败: %s\n', ME.message);
-    rethrow(ME);
+%% ------------------------------------------------------------------------
+% Step 1: discover DICOM files
+% -------------------------------------------------------------------------
+fprintf('[1/7] Discovering DICOM files...\n');
+file_list = discover_all_dicom(subject.path);
+fprintf('  -> %d DICOM files found.\n', numel(file_list));
+if isempty(file_list)
+    error('No DICOM files found under subject path: %s', subject.path);
 end
 
-% ====== Step 2: 按 UID 分组 ======
-fprintf('\n[Step 2/6] 按 SeriesInstanceUID 分组...\n');
-try
-    series_map = classify_series_simple(file_list);
-    fprintf('  ✅ 发现 %d 个不同序列\n', series_map.Count);
-catch ME
-    fprintf('  ❌ 分组失败: %s\n', ME.message);
-    rethrow(ME);
+%% ------------------------------------------------------------------------
+% Step 2: group by SeriesInstanceUID
+% -------------------------------------------------------------------------
+fprintf('\n[2/7] Grouping by SeriesInstanceUID...\n');
+series_map = classify_series_simple(file_list);
+fprintf('  -> %d series found.\n', series_map.Count);
+if series_map.Count == 0
+    error('No readable DICOM series found.');
 end
 
-% ====== Step 3: 识别 T1/Mag/Phase ======
-fprintf('\n[Step 3/6] 识别 T1/Mag/Phase 序列...\n');
-try
-    [t1_info, mag_info, pha_info] = find_key_series(series_map);
-
-    if isempty(pha_info)
-        error('未找到 PHASE 序列!');
-    end
-    if isempty(mag_info)
-        error('未找到 MAGNITUDE 序列!');
-    end
-
-    B0 = detect_B0(pha_info, mag_info, t1_info);
-    fprintf('  ✅ T1=%s  Mag=%s  Phase=%s\n', ...
-        iff(~isempty(t1_info), '✓', '✗'), ...
-        iff(~isempty(mag_info), '✓', '✗'), ...
-        iff(~isempty(pha_info), '✓', '✗'));
-    fprintf('  ✅ 场强 B0 = %.2f T\n', B0);
-catch ME
-    fprintf('  ❌ 识别失败: %s\n', ME.message);
-    rethrow(ME);
+%% ------------------------------------------------------------------------
+% Step 3: identify T1 / magnitude / phase series
+% -------------------------------------------------------------------------
+fprintf('\n[3/7] Identifying T1 / Magnitude / Phase series...\n');
+[t1_series, mag_series, phase_series] = find_key_series(series_map);
+if isempty(phase_series)
+    error('No PHASE series found. Need Siemens phase DICOM for WH-QSM.');
+end
+if isempty(mag_series)
+    error('No MAGNITUDE series found. Need magnitude DICOM for mask and SEPIA input.');
 end
 
-% ====== Step 4: 加载 Magnitude ======
-fprintf('\n[Step 4/6] 加载 Magnitude...\n');
-try
-    [magn_vol, mag_info_used] = load_magnitude_volume(mag_info, subject.path);
-    fprintf('  ✅ Magnitude 体积: %s\n', mat2str(size(magn_vol)));
-catch ME
-    fprintf('  ❌ Magnitude 加载失败: %s\n', ME.message);
-    fprintf('     at %s:%d\n', ME.stack(1).name, ME.stack(1).line);
-    rethrow(ME);
+B0 = detect_B0(phase_series.info, mag_series.info, get_info_or_empty(t1_series));
+B0_dir = detect_B0_dir(phase_series.info);
+fprintf('  Phase     : Ser#%s, %d files, %s\n', safe_series_no(phase_series.info), numel(phase_series.file_paths), get_desc(phase_series.info));
+fprintf('  Magnitude : Ser#%s, %d files, %s\n', safe_series_no(mag_series.info), numel(mag_series.file_paths), get_desc(mag_series.info));
+if ~isempty(t1_series)
+    fprintf('  T1        : Ser#%s, %d files, %s\n', safe_series_no(t1_series.info), numel(t1_series.file_paths), get_desc(t1_series.info));
+else
+    fprintf('  T1        : not found (WH-QSM does not require it)\n');
+end
+fprintf('  B0        : %.4g T\n', B0);
+fprintf('  B0 dir    : [%.4g %.4g %.4g]\n', B0_dir(1), B0_dir(2), B0_dir(3));
+
+%% ------------------------------------------------------------------------
+% Step 4: load magnitude
+% -------------------------------------------------------------------------
+fprintf('\n[4/7] Loading magnitude...\n');
+[magn_vol, mag_meta] = load_magnitude_volume(mag_series);
+fprintf('  Magnitude size: %s\n', mat2str(size(magn_vol)));
+fprintf('  Magnitude echo times: %s ms\n', mat2str(mag_meta.echo_times_ms, 6));
+if isfield(mag_meta, 'r2star_Hz') && any(mag_meta.r2star_Hz(:) > 0)
+    tmp_r2 = mag_meta.r2star_Hz(isfinite(mag_meta.r2star_Hz) & mag_meta.r2star_Hz > 0);
+    fprintf('  R2* map from magnitude: median=%.4g Hz, p95=%.4g Hz\n', median(tmp_r2), prctile(tmp_r2,95));
 end
 
-% ====== Step 5: 加载 Phase ======
-fprintf('\n[Step 5/6] 加载 Phase...\n');
-try
-    [pha_vol_rad, pha_info_used] = load_phase_volume_rad(pha_info, subject.path);
-    fprintf('  ✅ Phase 体积: %s\n', mat2str(size(pha_vol_rad)));
-    fprintf('  ✅ 相位值域: [%.4f, %.4f] rad\n', min(pha_vol_rad(:)), max(pha_vol_rad(:)));
-catch ME
-    fprintf('  ❌ Phase 加载失败: %s\n', ME.message);
-    fprintf('     at %s:%d\n', ME.stack(1).name, ME.stack(1).line);
-    rethrow(ME);
-end
+%% ------------------------------------------------------------------------
+% Step 5: load phase and fit field map
+% -------------------------------------------------------------------------
+fprintf('\n[5/7] Loading phase and fitting field map...\n');
+[fieldmap_Hz, fieldmap_ppm, phase_meta] = load_phase_fieldmap(phase_series, B0);
+fprintf('  Phase array size       : %s\n', mat2str(size(phase_meta.phase_rad_4d)));
+fprintf('  Phase echo times       : %s ms\n', mat2str(phase_meta.echo_times_ms, 6));
+fprintf('  Field fitting method   : %s\n', phase_meta.fit_method);
+fprintf('  Fieldmap Hz range      : [%.6g, %.6g] Hz\n', min(fieldmap_Hz(:)), max(fieldmap_Hz(:)));
+fprintf('  Fieldmap ppm range     : [%.6g, %.6g] ppm\n', min(fieldmap_ppm(:)), max(fieldmap_ppm(:)));
 
-% ====== rad → ppm 单位转换 ======
-fprintf('\n[Step 5.5] rad → ppm 单位转换...\n');
-try
-    TE_sec = scalarize(pha_info_used.EchoTime) / 1000;
-    gyro_MHz_per_T = 42.57747892;
-
-    % 🔴 关键修正: Siemens 12-bit Phase DICOM 的缩放约定
-    % 用户数据: RescaleSlope=2.0, RescaleIntercept=-4096
-    % 应用后: phase_dicom ∈ [-4096, +4094] (Siemens 内部单位, 非弧度!)
-    % 必须先 × (π/4096) 转成弧度, 再转 ppm
-    %
-    % 合并公式 (γ 用 MHz/T):
-    %   ppm = phase_dicom × 1 / (4096 × 2 × γ_MHz × B0 × TE_sec)
-
-    ppm_factor = 1 / (4096 * 2 * gyro_MHz_per_T * B0 * TE_sec);
-    fprintf('  B0=%.2fT, TE=%.4fms, γ=%.4f MHz/T\n', B0, TE_sec*1000, gyro_MHz_per_T);
-    fprintf('  ppm_factor = %.6e\n', ppm_factor);
-    fprintf('  公式: ppm = phase_dicom × 1 / (4096 × 2 × γ × B0 × TE)\n');
-
-    pha_vol_ppm = pha_vol_rad * ppm_factor;
-    fprintf('  ✅ ppm 值域: [%.4f, %.4f] ppm\n', ...
-        min(pha_vol_ppm(:)), max(pha_vol_ppm(:)));
-
-    if abs(max(pha_vol_ppm(:))) > 5 || abs(min(pha_vol_ppm(:))) < -5
-        warning('⚠️ ppm 值域异常 [%.3f, %.3f]，请检查 Phase Siemens 缩放', ...
-            min(pha_vol_ppm(:)), max(pha_vol_ppm(:)));
-    end
-catch ME
-    fprintf('  ❌ 转换失败: %s\n', ME.message);
-    rethrow(ME);
-end
-
-% ====== Step 6: 加载 T1 ======
-fprintf('\n[Step 6/6] 加载 T1...\n');
-try
-    if ~isempty(t1_info)
-        t1_vol = load_t1_volume(t1_info, subject.path);
-        fprintf('  ✅ T1 体积: %s\n', mat2str(size(t1_vol)));
-    else
-        fprintf('  ⚠️ 无 T1，使用占位\n');
+%% ------------------------------------------------------------------------
+% Step 6: load T1 if available
+% -------------------------------------------------------------------------
+fprintf('\n[6/7] Loading T1 / structural image...\n');
+if ~isempty(t1_series)
+    try
+        t1_vol = load_t1_volume(t1_series);
+        fprintf('  T1 size: %s\n', mat2str(size(t1_vol)));
+    catch ME
+        warning('T1 loading failed; using zeros. Reason: %s', ME.message);
         t1_vol = zeros(size(magn_vol), 'double');
     end
-catch ME
-    fprintf('  ⚠️ T1 加载失败: %s\n', ME.message);
-    fprintf('     使用占位零矩阵\n');
+else
     t1_vol = zeros(size(magn_vol), 'double');
 end
 
-% ====== 准备 11 个变量 ======
-fprintf('\n[Final] 准备 QSM2016 变量...\n');
-try
-    spatial_res = [scalarize(pha_info_used.PixelSpacing(2)), ...
-                   scalarize(pha_info_used.PixelSpacing(1)), ...
-                   scalarize(pha_info_used.SliceThickness)];
+%% ------------------------------------------------------------------------
+% Step 7: build mask, assemble data, save variables
+% -------------------------------------------------------------------------
+fprintf('\n[7/7] Building mask and assembling data...\n');
 
-    if ~isequal(size(t1_vol), size(magn_vol))
-        fprintf('  T1 %s → resize 到 %s\n', mat2str(size(t1_vol)), mat2str(size(magn_vol)));
-        t1_vol = resize_volume_nn(t1_vol, size(magn_vol));
-    end
-
-    mask = generate_brain_mask(magn_vol);
-    fprintf('  ✅ Brain mask: %d voxels (%.2f%%)\n', ...
-        nnz(mask), 100*nnz(mask)/numel(mask));
-
-    % 组装 data
-    data = struct();
-    data.phs_tissue = double(pha_vol_ppm);
-    data.phs_unwrap = double(pha_vol_rad);
-    data.phs_wrap   = wrap_to_pi(pha_vol_rad);
-    data.msk        = logical(mask);
-    data.magn       = double(magn_vol);
-    data.magn_raw   = double(magn_vol);
-    data.mp_rage    = double(t1_vol);
-    data.chi_33     = zeros(size(mask), 'double');
-    data.chi_cosmos = zeros(size(mask), 'double');
-    data.spatial_res = double(spatial_res);
-    data.N          = size(mask);
-    data.Mask       = logical(mask);
-    data.evaluation_mask = double(mask);
-    data.EchoTime       = scalarize(pha_info_used.EchoTime);
-    data.TE             = scalarize(pha_info_used.EchoTime) / 1000;
-    data.B0             = B0;
-    data.b0             = B0;
-    data.FieldStrength  = B0;
-    data.Manufacturer   = char(safe_field_str(pha_info_used, 'Manufacturer', ''));
-    data.patient_group  = subject.group;
-    data.subject_name   = subject.name;
-    data.ppm_factor     = ppm_factor;
-
-    % mask 应用
-    data.phs_tissue(~mask) = 0;
-    data.phs_unwrap(~mask) = 0;
-
-    fprintf('  ✅ data 结构体已组装\n');
-catch ME
-    fprintf('  ❌ 组装失败: %s\n', ME.message);
-    fprintf('     at %s:%d\n', ME.stack(1).name, ME.stack(1).line);
-    rethrow(ME);
+if ~isequal(size(fieldmap_Hz), size(magn_vol))
+    error('Phase fieldmap size %s does not match magnitude size %s. Resampling is intentionally not done in the WH-QSM loader.', ...
+        mat2str(size(fieldmap_Hz)), mat2str(size(magn_vol)));
 end
 
-% ====== 保存 .mat 文件 ======
-fprintf('\n[Save] 保存 11 个 .mat 变量...\n');
-try
-    save(fullfile(output_data_dir, 'phs_tissue.mat'),  'data');
-    fprintf('  ✅ phs_tissue.mat\n');
-catch ME
-    fprintf('  ❌ 保存失败: %s\n', ME.message);
-    rethrow(ME);
+if ~isequal(size(t1_vol), size(magn_vol))
+    fprintf('  T1 size %s -> nearest-neighbour resize to %s for storage only.\n', mat2str(size(t1_vol)), mat2str(size(magn_vol)));
+    t1_vol = resize_volume_nn(t1_vol, size(magn_vol));
 end
 
-fprintf('\n✅ 加载完成！phs_tissue: %s (ppm)\n', mat2str(size(data.phs_tissue)));
+spatial_res = get_spatial_res(phase_series.info);
+if any(~isfinite(spatial_res)) || any(spatial_res <= 0)
+    spatial_res = get_spatial_res(mag_series.info);
 end
+if any(~isfinite(spatial_res)) || any(spatial_res <= 0)
+    error('Could not determine valid voxel size from DICOM metadata.');
+end
+fprintf('  Voxel size: [%.6g %.6g %.6g] mm\n', spatial_res(1), spatial_res(2), spatial_res(3));
 
-%% =========================================================================
-%% 安全辅助函数
-%% =========================================================================
-function v = safe_field_str(s, fname, default)
-v = default;
-if ~isfield(s, fname) || isempty(s.(fname)), return; end
-val = s.(fname);
-if ischar(val), v = strtrim(val);
-elseif isstring(val), v = char(val);
-elseif iscell(val) && ~isempty(val) && ischar(val{1}), v = strtrim(val{1});
-elseif isnumeric(val) && isscalar(val), v = num2str(val);
-else, v = default; end
-end
+mask = generate_brain_mask(magn_vol, spatial_res, mask_erode_mm, mask_threshold_factor, ...
+    mask_method, bet_fractional_threshold, bet_vertical_gradient);
+voxel_volume_ml = prod(spatial_res) / 1000;
+fprintf('  Brain mask: %d voxels (%.2f%% of volume, %.1f mL)\n', ...
+    nnz(mask), 100*nnz(mask)/numel(mask), nnz(mask)*voxel_volume_ml);
 
-function v = scalarize(x)
-if isnumeric(x) && isscalar(x), v = double(x);
-elseif isnumeric(x) && ~isempty(x), v = double(x(1));
-elseif iscell(x) && ~isempty(x)
-    if isnumeric(x{1}), v = double(x{1});
-    elseif ischar(x{1}) && ~isempty(x{1}), v = str2double(x{1});
-    else, v = 0; end
-elseif ischar(x) && ~isempty(x), v = str2double(x);
-elseif isstring(x) && ~isempty(x), v = double(x(1));
-else, v = 0;
-end
-end
+fieldmap_Hz(~mask) = 0;
+fieldmap_ppm(~mask) = 0;
+phase_last = phase_meta.phase_unwrapped_4d(:,:,:,end);
+phase_last(~mask) = 0;
 
-function r = iff(c, a, b), if c, r = a; else, r = b; end, end
+TE_sec = phase_meta.echo_times_ms(:).' / 1000;
+delta_TE = compute_delta_te(TE_sec);
 
-function B0 = detect_B0(varargin)
-B0 = NaN;
-for k = 1:nargin
-    info = varargin{k};
-    if isempty(info), continue; end
-    if isfield(info, 'FieldStrength') && ~isempty(info.FieldStrength)
-        v = scalarize(info.FieldStrength);
-        if isnan(v) || v <= 0, continue; end
-        B0 = v; return;
-    end
-end
-if isnan(B0), B0 = 3; end
-end
+data = struct();
+data.fieldmap_Hz       = double(fieldmap_Hz);
+data.local_field_ppm   = double(fieldmap_ppm);
+data.R2star_Hz         = double(mag_meta.r2star_Hz);
+data.R2star_s0         = double(mag_meta.s0);
+data.R2star_fit_residual = double(mag_meta.r2_fit_residual);
+data.phs_tissue        = double(fieldmap_ppm);      % compatibility: ppm field used by older modules
+% phs_unwrap/phs_wrap are kept for compatibility and QC only. For multi-echo
+% data, they refer to the last echo after echo-dimension unwrap.
+data.phs_unwrap        = double(phase_last);
+data.phs_wrap          = wrap_to_pi(double(phase_meta.phase_rad_4d(:,:,:,end)));
+data.phase_rad_4d      = double(phase_meta.phase_rad_4d);
+data.phase_scaled_4d   = double(phase_meta.phase_scaled_4d);
+data.phase_fit_method  = phase_meta.fit_method;
+data.phase_fit_residual_rad = phase_meta.fit_residual_rad;
+data.mask_method       = mask_method;
+data.mask_erode_mm     = mask_erode_mm;
+data.mask_threshold_factor = mask_threshold_factor;
+data.bet_fractional_threshold = bet_fractional_threshold;
+data.bet_vertical_gradient = bet_vertical_gradient;
+data.msk               = logical(mask);
+data.Mask              = logical(mask);
+data.magn              = double(magn_vol);
+data.magn_raw          = double(magn_vol);
+data.mp_rage           = double(t1_vol);
+data.chi_33            = zeros(size(mask), 'double');
+data.chi_cosmos        = zeros(size(mask), 'double');
+data.evaluation_mask   = double(mask);
+data.spatial_res       = double(spatial_res);
+data.N                 = size(mask);
+data.EchoTime          = phase_meta.echo_times_ms(:).';      % ms, vector
+data.echo_times_ms     = phase_meta.echo_times_ms(:).';
+data.echo_times_sec    = TE_sec;
+data.TE                = TE_sec;
+data.delta_TE          = delta_TE;
+data.delta_TE_sec      = delta_TE;
+data.B0                = B0;
+data.b0                = B0;
+data.FieldStrength     = B0;
+data.MagneticFieldStrength = B0;
+data.B0_dir            = B0_dir;
+data.b0dir             = B0_dir;
+data.Manufacturer      = char(safe_field_str(phase_series.info, 'Manufacturer', ''));
+data.patient_group     = subject.group;
+data.subject_name      = subject.name;
+data.phase_conversion  = phase_meta.phase_conversion;
+data.phase_series_desc = get_desc(phase_series.info);
+data.mag_series_desc   = get_desc(mag_series.info);
+data.mag_echo_times_ms = mag_meta.echo_times_ms;
 
-function [slope, intercept] = safe_rescale(info)
-slope = 1; intercept = 0;
-if isfield(info, 'RescaleSlope') && ~isempty(info.RescaleSlope)
-    slope = scalarize(info.RescaleSlope);
-    if slope == 0, slope = 1; end
-end
-if isfield(info, 'RescaleIntercept') && ~isempty(info.RescaleIntercept)
-    intercept = scalarize(info.RescaleIntercept);
-end
+save_subject_variables(output_data_dir, data);
+
+fprintf('\nDICOM loading complete. WH-QSM input fieldmap: %s, TE=%s ms, delta_TE=%.6g ms.\n', ...
+    data.phase_fit_method, mat2str(data.echo_times_ms, 6), data.delta_TE * 1000);
 end
 
 %% =========================================================================
-%% 内部: DICOM 发现
-%% =========================================================================
+% DICOM discovery / classification
+% =========================================================================
 function file_list = discover_all_dicom(root_dir)
 file_list = {};
-all_files = dir(fullfile(root_dir, '**', '*'));
+seen = containers.Map('KeyType', 'char', 'ValueType', 'logical');
+try
+    all_files = dir(fullfile(root_dir, '**', '*'));
+catch
+    all_files = dir(root_dir);
+end
 all_files = all_files(~[all_files.isdir]);
-seen = {};
-for k = 1:length(all_files)
+for k = 1:numel(all_files)
+    fp = fullfile(all_files(k).folder, all_files(k).name);
+    if isKey(seen, fp), continue; end
     [~, ~, ext] = fileparts(all_files(k).name);
-    is_dcm = any(strcmpi(ext, {'.dcm', '.dicom', '.ima', '.001'}));
-    if ~is_dcm && isempty(ext)
-        is_dcm = check_magic(fullfile(all_files(k).folder, all_files(k).name));
+    is_dcm = any(strcmpi(ext, {'.dcm', '.dicom', '.ima', '.001', '.img'}));
+    if ~is_dcm
+        is_dcm = check_magic(fp);
     end
     if is_dcm
-        fp = fullfile(all_files(k).folder, all_files(k).name);
-        if ischar(fp) && ~any(strcmp(seen, fp))
-            file_list{end+1} = fp;
-            seen{end+1} = fp;
-        end
+        file_list{end+1} = fp; %#ok<AGROW>
+        seen(fp) = true;
     end
 end
 end
@@ -282,382 +260,920 @@ try
     fseek(fid, 128, 'bof');
     magic = fread(fid, 4, 'uint8=>char')';
     tf = strcmp(magic, 'DICM');
-catch, end
+catch
+    tf = false;
+end
 fclose(fid);
 end
 
-%% =========================================================================
-%% 内部: 序列分类
-%% =========================================================================
 function series_map = classify_series_simple(file_list)
 series_map = containers.Map('KeyType', 'char', 'ValueType', 'any');
-
-for k = 1:length(file_list)
-    try
-        info = dicominfo(file_list{k});
-        uid = '';
-        if isfield(info, 'SeriesInstanceUID') && ~isempty(info.SeriesInstanceUID)
-            raw = info.SeriesInstanceUID;
-            if ischar(raw), uid = strtrim(raw);
-            elseif iscell(raw) && ~isempty(raw), uid = strtrim(raw{1});
-            elseif isstring(raw), uid = char(raw);
-            end
-        end
-        if isempty(uid), uid = sprintf('__NO_UID_%d', k); end
-
-        if isKey(series_map, uid)
-            s = series_map(uid);
-            s.file_paths{end+1} = file_list{k};
-            series_map(uid) = s;
-        else
-            series_map(uid) = struct( ...
-                'file_paths', {{file_list{k}}}, ...
-                'info', info);
-        end
-    catch ME
-        fprintf('  ⚠️ 跳过 %s: %s\n', file_list{k}, ME.message);
-    end
-end
-end
-
-%% =========================================================================
-%% 内部: 找出 T1 / Mag / Phase
-%% =========================================================================
-function [t1_info, mag_info, pha_info] = find_key_series(series_map)
-t1_info = []; mag_info = []; pha_info = [];
-
-keys = series_map.keys;
-for k = 1:length(keys)
-    s = series_map(keys{k});
-    info = s.info;
-
-    sd = '';
-    it = '';
-    if isfield(info, 'SeriesDescription'), sd = lower(char(info.SeriesDescription)); end
-    if isfield(info, 'ImageType'),         it = lower(char(info.ImageType)); end
-
-    if contains(sd, 'mprage') || contains(sd, 't1')
-        t1_info = info;
-    elseif contains(it, '\p\')
-        if isempty(pha_info) || ~contains(it, 'norm')
-            pha_info = info;
-        end
-    elseif contains(it, '\m\')
-        if contains(it, 'swi') || contains(it, 'mnip')
-            continue;
-        end
-        if isempty(mag_info) || ~contains(it, 'norm')
-            mag_info = info;
-        end
-    end
-end
-end
-
-%% =========================================================================
-%% 内部: 加载 Magnitude (多回波 → 沿 echo 维平均)
-%% =========================================================================
-function [vol, info_used] = load_magnitude_volume(info, root_dir)
-uid = extract_uid(info);
-files = find_files_by_uid(root_dir, uid);
-
-[slope, intercept] = safe_rescale(info);
-fprintf('  RescaleSlope=%.4f, RescaleIntercept=%.4f\n', slope, intercept);
-
-if isempty(files)
-    error('未找到 Magnitude DICOM');
-end
-
-% 检测多回波: 按 (EchoNumber, InstanceNumber) 排序后分组
-vol4d = build_4d_volume(files, slope, intercept);
-
-fprintf('  体素: [%d %d %d] (slice=%d, echo=%d)\n', ...
-    size(vol4d,1), size(vol4d,2), size(vol4d,3), ...
-    size(vol4d,3), size(vol4d,4));
-
-% Magnitude: 沿 echo 维平均 (提升 SNR)
-vol = mean(vol4d, 4);
-
-info_used = info;
-end
-
-%% =========================================================================
-%% 内部: 加载 Phase (多回波 → 取最后一个 echo)
-%% =========================================================================
-function [vol, info_used] = load_phase_volume_rad(info, root_dir)
-uid = extract_uid(info);
-files = find_files_by_uid(root_dir, uid);
-
-[slope, intercept] = safe_rescale(info);
-fprintf('  RescaleSlope=%.4f, RescaleIntercept=%.4f\n', slope, intercept);
-
-pix_rep = 0;
-if isfield(info, 'PixelRepresentation') && ~isempty(info.PixelRepresentation)
-    pix_rep = scalarize(info.PixelRepresentation);
-end
-bits = 12;
-if isfield(info, 'BitsStored') && ~isempty(info.BitsStored)
-    bits = scalarize(info.BitsStored);
-end
-
-if isempty(files)
-    error('未找到 Phase DICOM');
-end
-
-% 检测多回波: 按 (EchoNumber, InstanceNumber) 排序后分组
-% 注意: Phase 在加载时就要处理 PixelRepresentation 和缩放
-vol4d = build_4d_volume(files, slope, intercept, pix_rep, bits);
-
-fprintf('  体素: [%d %d %d] (slice=%d, echo=%d)\n', ...
-    size(vol4d,1), size(vol4d,2), size(vol4d,3), ...
-    size(vol4d,3), size(vol4d,4));
-
-% Phase: Siemens 通常只在最后一个 TE 输出 phase → 取最后 echo
-% 但如果有多个 TE 的 phase，做 echo 拟合更好
-% 这里先简单取最后 echo
-vol = vol4d(:,:,:,end);
-
-info_used = info;
-end
-
-%% =========================================================================
-%% 内部: 加载 T1
-%% =========================================================================
-function vol = load_t1_volume(info, root_dir)
-uid = extract_uid(info);
-files = find_files_by_uid(root_dir, uid);
-files = sort_by_position(files);
-
-[slope, intercept] = safe_rescale(info);
-
-n = length(files);
-if n == 0
-    warning('未找到 T1 DICOM');
-    vol = []; return;
-end
-
-sample = dicomread(files{1});
-sz = size(sample);
-vol = zeros(sz, 'double');
-
-for k = 1:n
-    X = double(dicomread(files{k}));
-    X = X * slope + intercept;
-    vol(:,:,k) = X;
-end
-end
-
-%% =========================================================================
-%% 内部: 工具函数
-%% =========================================================================
-function uid = extract_uid(info)
-uid = '';
-if ~isfield(info, 'SeriesInstanceUID'), return; end
-raw = info.SeriesInstanceUID;
-if isempty(raw), return; end
-if ischar(raw), uid = strtrim(raw);
-elseif iscell(raw) && ~isempty(raw), uid = strtrim(raw{1});
-elseif isstring(raw), uid = char(raw);
-end
-end
-
-function files = find_files_by_uid(root_dir, target_uid)
-files = {};
-all_dcm = dir(fullfile(root_dir, '**', '*.dcm'));
-for k = 1:length(all_dcm)
-    fp = fullfile(all_dcm(k).folder, all_dcm(k).name);
-    if ~ischar(fp), continue; end
+for k = 1:numel(file_list)
+    fp = file_list{k};
     try
         info = dicominfo(fp);
-        cu = extract_uid(info);
-        if ~isempty(cu) && strcmp(cu, target_uid)
-            files{end+1} = fp;
+        uid = safe_field_str(info, 'SeriesInstanceUID', '');
+        if isempty(uid)
+            uid = sprintf('__NO_UID_%06d', k);
         end
-    catch
+        if isKey(series_map, uid)
+            s = series_map(uid);
+            s.file_paths{end+1} = fp;
+            series_map(uid) = s;
+        else
+            s = struct();
+            s.file_paths = {fp};
+            s.info = info;
+            s.uid = uid;
+            series_map(uid) = s;
+        end
+    catch ME
+        fprintf('  Skipping unreadable DICOM %s: %s\n', fp, ME.message);
     end
 end
 end
 
-function files = sort_by_echo(files)
-% 简化的回波排序 (避免与 sort_files_by_echo 冲突)
-n = length(files);
-en = zeros(n, 1);
-in = zeros(n, 1);
-for k = 1:n
-    try
-        info = dicominfo(files{k});
-        en(k) = safe_dicom_num(info, 'EchoNumber', k);
-        in(k) = safe_dicom_num(info, 'InstanceNumber', k);
-    catch
-        en(k) = k;
-        in(k) = k;
+function [t1_series, mag_series, phase_series] = find_key_series(series_map)
+% Robust series selection for WH-QSM.
+%
+% Important failure mode fixed here:
+%   T1/MPRAGE DICOM ImageType often contains "M" because it is a magnitude
+%   image. It must NOT be used as the SWI magnitude paired with phase.
+%
+% Selection order:
+%   1) find phase candidates
+%   2) combine/select phase series
+%   3) choose magnitude candidate that is geometry-compatible with phase
+%   4) keep T1 separately as optional structural image
+
+t1_series = [];
+mag_series = [];
+phase_series = [];
+
+t1_best = -Inf;
+phase_candidates = {};
+mag_candidates = {};
+keys = series_map.keys;
+
+for k = 1:numel(keys)
+    s = series_map(keys{k});
+    info = s.info;
+    sd = lower(safe_field_str(info, 'SeriesDescription', ''));
+    pn = lower(safe_field_str(info, 'ProtocolName', ''));
+    it = lower(image_type_to_string(safe_field_any(info, 'ImageType', '')));
+    folder_label = lower(get_series_folder_label(s.file_paths));
+    nfiles = numel(s.file_paths);
+    text_all = [sd ' ' pn ' ' it ' ' folder_label];
+
+    % Folder layout observed in the real dataset:
+    %   8_t1_mprage_sag_p2_iso  -> structural T1, never WH-QSM magnitude
+    %   14_Mag_Images / 15_Mag_Images -> raw SWI magnitude candidates
+    %   16_Pha_Images -> raw SWI phase
+    %   17/18_mIP_Images(SW), 19/20_SWI_Images -> postprocessed, reject
+    is_structural = contains_any([sd ' ' pn ' ' folder_label], {'mprage','mp-rage','t1'});
+    is_projection = contains_any(text_all, {'mip','minip','mnip'});
+    is_swi_post   = contains_any([sd ' ' folder_label], {'swi_images','swi images','swi_image','swi post','swi_post'});
+    is_raw_mag_folder = contains_any(folder_label, {'mag_images','mag images'});
+    is_raw_pha_folder = contains_any(folder_label, {'pha_images','pha images','phase_images','phase images'});
+
+    % T1 candidate
+    t1_score = 0;
+    if is_structural, t1_score = t1_score + 30; end
+    if contains_any(folder_label, {'8_t1','t1_mprage'}), t1_score = t1_score + 20; end
+    t1_score = t1_score + min(nfiles/100, 5);
+
+    % Phase candidate. The observed folder 16_Pha_Images is a strong prior.
+    phase_score = 0;
+    if is_raw_pha_folder, phase_score = phase_score + 80; end
+    if contains_any(it, {'\p\','phase'}), phase_score = phase_score + 40; end
+    if contains_any(sd, {'phase','pha','ph_','_ph'}), phase_score = phase_score + 10; end
+    if is_projection || is_swi_post, phase_score = phase_score - 40; end
+    if is_structural, phase_score = phase_score - 80; end
+    phase_score = phase_score + min(nfiles/100, 5);
+
+    % SWI magnitude candidate. The observed 14/15_Mag_Images folders are
+    % strong priors; T1 and postprocessed SWI/mIP are explicitly rejected.
+    mag_score = -Inf;
+    if ~is_structural && ~is_projection && ~is_swi_post
+        mag_score = 0;
+        if is_raw_mag_folder, mag_score = mag_score + 90; end
+        if contains_any(it, {'\m\','magnitude'}), mag_score = mag_score + 35; end
+        if contains_any(sd, {'mag','magnitude','mag_images'}), mag_score = mag_score + 25; end
+        if contains_any(text_all, {'norm'}), mag_score = mag_score - 5; end
+        mag_score = mag_score + min(nfiles/100, 5);
+    end
+
+    s.score_phase = phase_score;
+    s.score_mag = mag_score;
+    s.score_t1 = t1_score;
+
+    if t1_score > t1_best
+        t1_best = t1_score;
+        t1_series = s;
+    end
+    if phase_score >= 20
+        phase_candidates{end+1} = s; %#ok<AGROW>
+    end
+    if isfinite(mag_score) && mag_score >= 20
+        mag_candidates{end+1} = s; %#ok<AGROW>
     end
 end
-% 用 index-based sort 避免 sortrows
-[~, ord_e] = sort(en);
-[~, ord_in] = sort(in);
-% 用 lex 排序 (先 echo 后 instance)
-combined = en * 1e6 + in;
-[~, ord] = sort(combined);
-files = files(ord);
+
+phase_series = select_phase_series(phase_candidates);
+mag_series = select_magnitude_series(mag_candidates, phase_series);
+
+if t1_best < 15
+    t1_series = [];
+end
 end
 
-%% =========================================================================
-%% 内部: 安全提取 DICOM 数值字段
-%% =========================================================================
-function v = safe_dicom_num(info, fname, default)
-v = default;
-if ~isfield(info, fname), return; end
-val = info.(fname);
-if isempty(val), return; end
-if isnumeric(val) && isscalar(val)
-    v = double(val);
-elseif isnumeric(val) && ~isempty(val)
-    v = double(val(1));
-elseif iscell(val) && ~isempty(val) && isnumeric(val{1})
-    v = double(val{1});
-elseif ischar(val) && ~isempty(val)
-    v = str2double(val);
+function phase_series = select_phase_series(phase_candidates)
+phase_series = [];
+if isempty(phase_candidates)
+    return;
+end
+scores = cellfun(@(s) s.score_phase, phase_candidates);
+ser_nums = cellfun(@(s) safe_dicom_num(s.info, 'SeriesNumber', 9999), phase_candidates);
+[~, ord] = sortrows([-scores(:), ser_nums(:)], [1 2]);
+phase_candidates = phase_candidates(ord);
+
+% Use the best phase candidate as geometry reference. If phase echoes are
+% split across compatible SeriesInstanceUIDs, combine compatible candidates.
+phase_series = phase_candidates{1};
+phase_series.file_paths = {};
+phase_series.combined_uids = {};
+ref = phase_candidates{1};
+for i = 1:numel(phase_candidates)
+    s = phase_candidates{i};
+    if is_compatible_series(ref.info, s.info)
+        phase_series.file_paths = [phase_series.file_paths, s.file_paths]; %#ok<AGROW>
+        if isfield(s, 'uid'), phase_series.combined_uids{end+1} = s.uid; end %#ok<AGROW>
+    else
+        fprintf('  Skipping PHASE candidate Ser#%s as geometry differs from selected phase series.\n', safe_series_no(s.info));
+    end
+end
+fprintf('  Selected PHASE series: Ser#%s, %d compatible UID(s), %d files.\n', ...
+    safe_series_no(phase_series.info), max(1,numel(phase_series.combined_uids)), numel(phase_series.file_paths));
+end
+
+function mag_series = select_magnitude_series(mag_candidates, phase_series)
+mag_series = [];
+if isempty(mag_candidates)
+    return;
+end
+
+% The WH-QSM magnitude must match the phase geometry. This prevents selecting
+% T1/MPRAGE as magnitude (e.g. [256 256 192]) when phase is SWI geometry
+% (e.g. [336 384 104]).
+compatible = false(1, numel(mag_candidates));
+for i = 1:numel(mag_candidates)
+    if ~isempty(phase_series)
+        compatible(i) = is_compatible_series(phase_series.info, mag_candidates{i}.info);
+    else
+        compatible(i) = true;
+    end
+end
+
+if any(compatible)
+    cand = mag_candidates(compatible);
 else
-    v = default;
+    fprintf('  WARNING: no MAGNITUDE candidate matches phase geometry; using highest-score magnitude candidate.\n');
+    cand = mag_candidates;
+end
+
+scores = cellfun(@(s) s.score_mag, cand);
+ser_nums = cellfun(@(s) safe_dicom_num(s.info, 'SeriesNumber', 9999), cand);
+[~, ord] = sortrows([-scores(:), ser_nums(:)], [1 2]);
+cand = cand(ord);
+mag_series = cand{1};
+
+% Do not blindly merge all magnitude-like series: SWI postprocessed images can
+% share geometry but are not raw echoes. The selected best series is enough for
+% mask and SEPIA magnitude input; if it contains multiple echoes, build_4d_volume
+% will average them.
+fprintf('  Selected MAGNITUDE series: Ser#%s, score %.2f, %d files.\n', ...
+    safe_series_no(mag_series.info), mag_series.score_mag, numel(mag_series.file_paths));
+
+if ~isempty(phase_series) && ~is_compatible_series(phase_series.info, mag_series.info)
+    fprintf('  WARNING: selected magnitude geometry still differs from phase; downstream size check may fail.\n');
+end
+end
+
+function combined = combine_compatible_series(candidates, label)
+combined = [];
+if isempty(candidates)
+    return;
+end
+
+% Sort candidates by SeriesNumber for deterministic echo ordering when echoes
+% are stored as separate SeriesInstanceUIDs.
+ser_nums = zeros(1, numel(candidates));
+for i = 1:numel(candidates)
+    ser_nums(i) = safe_dicom_num(candidates{i}.info, 'SeriesNumber', i);
+end
+[~, ord] = sort(ser_nums);
+candidates = candidates(ord);
+
+ref = candidates{1};
+combined = ref;
+combined.file_paths = {};
+combined.combined_uids = {};
+
+for i = 1:numel(candidates)
+    s = candidates{i};
+    if is_compatible_series(ref.info, s.info)
+        combined.file_paths = [combined.file_paths, s.file_paths]; %#ok<AGROW>
+        if isfield(s, 'uid'), combined.combined_uids{end+1} = s.uid; end %#ok<AGROW>
+    else
+        fprintf('  Skipping %s candidate Ser#%s as geometry differs from selected series.\n', ...
+            label, safe_series_no(s.info));
+    end
+end
+
+if isempty(combined.file_paths)
+    combined = [];
+else
+    fprintf('  Combined %s series: %d compatible UID(s), %d files.\n', ...
+        label, max(1, numel(combined.combined_uids)), numel(combined.file_paths));
+end
+end
+
+function tf = is_compatible_series(info_ref, info)
+rows_ref = safe_dicom_num(info_ref, 'Rows', NaN);
+cols_ref = safe_dicom_num(info_ref, 'Columns', NaN);
+rows = safe_dicom_num(info, 'Rows', NaN);
+cols = safe_dicom_num(info, 'Columns', NaN);
+if rows_ref ~= rows || cols_ref ~= cols
+    tf = false;
+    return;
+end
+sr_ref = get_spatial_res(info_ref);
+sr = get_spatial_res(info);
+if all(isfinite(sr_ref)) && all(isfinite(sr))
+    tf = max(abs(sr_ref - sr)) < 1e-3;
+else
+    tf = true;
 end
 end
 
 %% =========================================================================
-%% 内部: 构建 4D 体数据 [x, y, slice, echo]
-%% =========================================================================
-function vol4d = build_4d_volume(files, slope, intercept, pix_rep, bits)
-% 读取所有 DICOM 并组织成 4D 数组 [x, y, n_slices, n_echoes]
+% Volume loaders
+% =========================================================================
+function [vol, meta] = load_magnitude_volume(series)
+[vol4d, echo_times_ms, echo_numbers] = build_4d_volume(series.file_paths);
+if isempty(vol4d)
+    error('Magnitude volume is empty.');
+end
+vol = mean(vol4d, 4);
+[r2star_Hz, s0, r2_fit_residual] = compute_r2star_from_magnitude(vol4d, echo_times_ms);
+meta = struct('echo_times_ms', echo_times_ms, ...
+    'echo_numbers', echo_numbers, ...
+    'n_echoes', size(vol4d,4), ...
+    'r2star_Hz', r2star_Hz, ...
+    's0', s0, ...
+    'r2_fit_residual', r2_fit_residual);
+end
 
-n = length(files);
+function [r2star_Hz, s0, residual] = compute_r2star_from_magnitude(mag4d, echo_times_ms)
+% Compute R2* from multi-echo magnitude by log-linear fitting:
+%   S(TE) = S0 * exp(-R2* TE)
+% This feature map is required by susceptibility source separation methods.
+TE_sec = double(echo_times_ms(:).') / 1000;
+mag4d = double(mag4d);
+mag4d(~isfinite(mag4d)) = 0;
+if numel(TE_sec) < 2 || size(mag4d,4) < 2 || any(~isfinite(TE_sec))
+    r2star_Hz = zeros(size(mag4d,1), size(mag4d,2), size(mag4d,3));
+    s0 = mag4d(:,:,:,1);
+    residual = zeros(size(s0));
+    return;
+end
+[TE_sec, ord] = sort(TE_sec);
+mag4d = mag4d(:,:,:,ord);
+logS = log(max(mag4d, eps));
+t = reshape(TE_sec, [1 1 1 numel(TE_sec)]);
+t0 = mean(TE_sec);
+tc = t - t0;
+denom = sum((TE_sec - t0).^2);
+logS_mean = mean(logS, 4);
+slope = sum((logS - logS_mean) .* tc, 4) ./ max(denom, eps);
+intercept = logS_mean - slope .* t0;
+r2star_Hz = max(-slope, 0);
+s0 = exp(intercept);
+pred = intercept + slope .* t;
+residual = sqrt(mean((logS - pred).^2, 4));
+r2star_Hz(~isfinite(r2star_Hz)) = 0;
+s0(~isfinite(s0)) = 0;
+residual(~isfinite(residual)) = 0;
+end
+
+function [fieldmap_Hz, fieldmap_ppm, meta] = load_phase_fieldmap(series, B0)
+[phase_scaled_4d, echo_times_ms, echo_numbers] = build_4d_volume(series.file_paths);
+if isempty(phase_scaled_4d)
+    error('Phase volume is empty.');
+end
+
+[phase_rad_4d, conv] = convert_phase_to_rad(phase_scaled_4d, series.info);
+TE_sec = double(echo_times_ms(:).') / 1000;
+if any(~isfinite(TE_sec)) || any(TE_sec <= 0)
+    error('Invalid or missing EchoTime in phase DICOM series: %s ms', mat2str(echo_times_ms));
+end
+
+[TE_sec, order] = sort(TE_sec);
+phase_rad_4d = phase_rad_4d(:,:,:,order);
+phase_scaled_4d = phase_scaled_4d(:,:,:,order);
+echo_times_ms = echo_times_ms(order);
+echo_numbers = echo_numbers(order);
+
+nEcho = numel(TE_sec);
+% Do NOT call MATLAB/third-party unwrap() here. After SEPIA/FANSI is added to
+% the path, some toolboxes may shadow MATLAB's unwrap with a different
+% signature, which caused the second subject to fail with "too many input
+% arguments". Echo-dimension unwrapping is simple and deterministic, so use a
+% local implementation.
+phase_unwrapped_4d = unwrap_echo_phase_local(phase_rad_4d);
+
+if nEcho >= 2 && numel(unique(TE_sec)) >= 2
+    t = reshape(TE_sec, [1 1 1 nEcho]);
+    t0 = mean(TE_sec);
+    tc = t - t0;
+    denom = sum((TE_sec - t0).^2);
+    phase_mean = mean(phase_unwrapped_4d, 4);
+    slope_rad_per_sec = sum((phase_unwrapped_4d - phase_mean) .* tc, 4) ./ max(denom, eps);
+    intercept = phase_mean - slope_rad_per_sec .* t0;
+    pred = intercept + slope_rad_per_sec .* t;
+    residual = sqrt(mean((phase_unwrapped_4d - pred).^2, 4));
+    fieldmap_Hz = slope_rad_per_sec ./ (2*pi);
+    fit_method = sprintf('multi_echo_linear_phase_fit_%decho', nEcho);
+else
+    fieldmap_Hz = phase_unwrapped_4d(:,:,:,end) ./ (2*pi*TE_sec(end));
+    residual = zeros(size(fieldmap_Hz));
+    fit_method = 'single_echo_phase_over_TE_fallback';
+end
+
+gyro_MHz_per_T = 42.57747892;
+fieldmap_ppm = fieldmap_Hz ./ (gyro_MHz_per_T * B0);
+
+meta = struct();
+meta.phase_scaled_4d = phase_scaled_4d;
+meta.phase_rad_4d = phase_rad_4d;
+meta.phase_unwrapped_4d = phase_unwrapped_4d;
+meta.echo_times_ms = echo_times_ms(:).';
+meta.echo_numbers = echo_numbers(:).';
+meta.fit_method = fit_method;
+meta.fit_residual_rad = residual;
+meta.phase_conversion = conv;
+end
+
+function ph_unwrapped = unwrap_echo_phase_local(ph)
+% Local unwrap along 4th dimension. This avoids calling any path-dependent
+% unwrap() implementation. Adjacent echo phase differences are mapped to
+% (-pi, pi], then accumulated.
+ph = double(ph);
+ph_unwrapped = ph;
+if ndims(ph) < 4 || size(ph,4) <= 1
+    return;
+end
+for e = 2:size(ph,4)
+    d = ph(:,:,:,e) - ph(:,:,:,e-1);
+    d_wrapped = mod(d + pi, 2*pi) - pi;
+    ph_unwrapped(:,:,:,e) = ph_unwrapped(:,:,:,e-1) + d_wrapped;
+end
+end
+
+function vol = load_t1_volume(series)
+[vol4d, ~, ~] = build_4d_volume(series.file_paths);
+if isempty(vol4d)
+    vol = [];
+else
+    vol = vol4d(:,:,:,1);
+end
+end
+
+function [vol4d, echo_times_ms, echo_numbers] = build_4d_volume(files)
+% Build [row, col, slice, echo] volume. Echo grouping prioritises EchoTime;
+% slice ordering prioritises ImagePositionPatient/SliceLocation over InstanceNumber.
+
+n = numel(files);
 if n == 0
-    vol4d = []; return;
+    vol4d = [];
+    echo_times_ms = [];
+    echo_numbers = [];
+    return;
 end
 
-% 提取每个文件的 (echo, instance)
-echo_nums = zeros(n, 1);
-inst_nums = zeros(n, 1);
+infos = cell(n,1);
+echo_time = nan(n,1);
+echo_num = nan(n,1);
+inst_num = nan(n,1);
+slice_pos = nan(n,1);
+
 for k = 1:n
-    try
-        info = dicominfo(files{k});
-        echo_nums(k) = safe_dicom_num(info, 'EchoNumber', 1);
-        inst_nums(k) = safe_dicom_num(info, 'InstanceNumber', k);
-    catch
-        echo_nums(k) = 1;
-        inst_nums(k) = k;
-    end
+    infos{k} = dicominfo(files{k});
+    echo_time(k) = safe_dicom_num(infos{k}, 'EchoTime', NaN);
+    echo_num(k) = safe_dicom_num(infos{k}, 'EchoNumber', NaN);
+    if isnan(echo_num(k)), echo_num(k) = safe_dicom_num(infos{k}, 'EchoNumbers', NaN); end
+    inst_num(k) = safe_dicom_num(infos{k}, 'InstanceNumber', k);
+    slice_pos(k) = get_slice_position(infos{k}, inst_num(k));
 end
 
-% 按 (echo, instance) 排序 (lex sort)
-combined = double(echo_nums) * 1e6 + double(inst_nums);
-[~, ord] = sort(combined);
-files = files(ord);
-echo_nums = echo_nums(ord);
-inst_nums = inst_nums(ord);
-
-% 唯一 echo 和 slice
-unique_echoes = unique(echo_nums);
-n_echoes = length(unique_echoes);
-
-% 每个 echo 应该有相同数量的 slice
-unique_inst_per_echo = unique(inst_nums(echo_nums == unique_echoes(1)));
-n_slices = length(unique_inst_per_echo);
-
-% 检查
-for e = 2:n_echoes
-    inst_e = unique(inst_nums(echo_nums == unique_echoes(e)));
-    if length(inst_e) ~= n_slices
-        fprintf('  ⚠️ Echo %g 有 %d slice，Echo 1 有 %d\n', ...
-            unique_echoes(e), length(inst_e), n_slices);
-    end
+finite_te = echo_time(isfinite(echo_time));
+if numel(unique(round(finite_te*1000)/1000)) >= 2
+    echo_key = round(echo_time * 1000) / 1000;  % ms rounded to 1 us
+elseif any(isfinite(echo_num))
+    echo_key = echo_num;
+else
+    echo_key = ones(n,1);
+end
+if all(~isfinite(echo_key))
+    echo_key = ones(n,1);
+else
+    echo_key(~isfinite(echo_key)) = 1;
 end
 
-% 读取第一个文件确定尺寸
+unique_echo_keys = unique(echo_key(isfinite(echo_key)));
+unique_echo_keys = sort(unique_echo_keys(:).');
+n_echoes = numel(unique_echo_keys);
+if n_echoes == 0
+    unique_echo_keys = 1;
+    n_echoes = 1;
+end
+
 sample = dicomread(files{1});
 sz = size(sample);
-if length(sz) < 2, sz = [sz 1]; end
-sz_xy = sz(1:2);
+if numel(sz) < 2
+    error('DICOM pixel data is not 2D: %s', files{1});
+end
+rows = sz(1); cols = sz(2);
 
-% 创建 4D 数组
-vol4d = zeros(sz_xy(1), sz_xy(2), n_slices, n_echoes, 'double');
-
-% 填充
-for k = 1:n
-    X = double(dicomread(files{k}));
-    if nargin >= 4 && ~isempty(pix_rep) && pix_rep == 1
-        if nargin < 5 || isempty(bits), bits = 12; end
-        X = X - 2^(bits-1);
+idx_by_echo = cell(1, n_echoes);
+n_slices = 0;
+for e = 1:n_echoes
+    idx = find(echo_key == unique_echo_keys(e));
+    if isempty(idx) && n_echoes == 1
+        idx = 1:n;
     end
-    X = X * slope + intercept;
-
-    % 找这个文件对应哪个 (slice, echo)
-    e_idx = find(unique_echoes == echo_nums(k), 1);
-    s_idx = find(unique_inst_per_echo == inst_nums(k), 1);
-    if isempty(e_idx) || isempty(s_idx)
-        fprintf('  ⚠️ 跳过: file %d (echo=%g, inst=%g)\n', ...
-            k, echo_nums(k), inst_nums(k));
-        continue;
+    if all(isfinite(slice_pos(idx)))
+        [~, ord] = sort(slice_pos(idx), 'ascend');
+    else
+        [~, ord] = sort(inst_num(idx), 'ascend');
     end
-
-    vol4d(:,:,s_idx,e_idx) = X;
+    idx_by_echo{e} = idx(ord);
+    n_slices = max(n_slices, numel(idx));
 end
+
+if n_slices == 0
+    error('No slices found while building 4D volume.');
 end
 
-function files = sort_by_position(files)
-n = length(files);
-in = zeros(n, 1);
-for k = 1:n
-    try
-        info = dicominfo(files{k});
-        in(k) = scalarize(getfield_or(info, 'InstanceNumber', k));
-    catch
-        in(k) = k;
+vol4d = zeros(rows, cols, n_slices, n_echoes, 'double');
+echo_times_ms = nan(1, n_echoes);
+echo_numbers = nan(1, n_echoes);
+
+for e = 1:n_echoes
+    idx = idx_by_echo{e};
+    echo_times_ms(e) = nanmedian_local(echo_time(idx));
+    echo_numbers(e) = nanmedian_local(echo_num(idx));
+    if isnan(echo_numbers(e)), echo_numbers(e) = e; end
+    if isnan(echo_times_ms(e))
+        echo_times_ms(e) = safe_dicom_num(infos{idx(1)}, 'EchoTime', NaN);
+    end
+    if numel(idx) ~= n_slices
+        warning('Echo %d has %d slices, while max slices is %d. Missing slices will be zero.', e, numel(idx), n_slices);
+    end
+    for s = 1:numel(idx)
+        k = idx(s);
+        Xraw = dicomread(files{k});
+        X = double(Xraw);
+        X = maybe_convert_signed(X, Xraw, infos{k});
+        slope = safe_dicom_num(infos{k}, 'RescaleSlope', 1);
+        intercept = safe_dicom_num(infos{k}, 'RescaleIntercept', 0);
+        if ~isfinite(slope) || slope == 0, slope = 1; end
+        if ~isfinite(intercept), intercept = 0; end
+        X = X * slope + intercept;
+        vol4d(:,:,s,e) = X;
     end
 end
-[~, ord] = sort(in);
-files = files(ord);
 end
 
-function v = getfield_or(s, fname, default)
-if isfield(s, fname) && ~isempty(s.(fname))
-    v = s.(fname);
+function X = maybe_convert_signed(X, Xraw, info)
+pix_rep = safe_dicom_num(info, 'PixelRepresentation', 0);
+bits = safe_dicom_num(info, 'BitsStored', 16);
+if pix_rep == 1 && isa(Xraw, 'uint16') && isfinite(bits) && bits > 0 && bits < 16
+    cutoff = 2^(bits-1);
+    fullscale = 2^bits;
+    idx = X >= cutoff;
+    X(idx) = X(idx) - fullscale;
+end
+end
+
+function val = nanmedian_local(x)
+x = x(isfinite(x));
+if isempty(x)
+    val = NaN;
 else
-    v = default;
+    val = median(x);
 end
 end
 
+function [phase_rad, conv] = convert_phase_to_rad(phase_scaled, info)
+maxAbs = max(abs(phase_scaled(:)));
+bits = safe_dicom_num(info, 'BitsStored', 12);
+if ~isfinite(bits) || bits <= 0
+    bits = 12;
+end
+
+conv = struct();
+conv.input_max_abs = maxAbs;
+conv.bits_stored = bits;
+
+if maxAbs <= pi + 0.2
+    phase_rad = phase_scaled;
+    conv.method = 'already_radians';
+    conv.scale_to_rad = 1;
+elseif maxAbs <= 2*pi + 0.5
+    phase_rad = phase_scaled;
+    conv.method = 'already_radians_wide_range';
+    conv.scale_to_rad = 1;
+else
+    % Siemens common convention after RescaleSlope/Intercept:
+    % scaled phase is approximately [-4096, 4094] for 12-bit data.
+    denom = 2^bits;
+    if denom < 1024 || denom > 65536
+        denom = 4096;
+    end
+    phase_rad = phase_scaled * (pi / denom);
+    conv.method = sprintf('siemens_internal_units_times_pi_over_%d', denom);
+    conv.scale_to_rad = pi / denom;
+end
+
+fprintf('  Phase conversion: %s (scale %.9g), input max abs %.6g -> rad max abs %.6g\n', ...
+    conv.method, conv.scale_to_rad, maxAbs, max(abs(phase_rad(:))));
+end
+
 %% =========================================================================
-%% 内部: 脑 mask
+% Metadata helpers
+% =========================================================================
+function B0 = detect_B0(varargin)
+B0 = NaN;
+fields = {'MagneticFieldStrength','FieldStrength','ImagingFrequency'};
+for k = 1:nargin
+    info = varargin{k};
+    if isempty(info), continue; end
+    for f = 1:numel(fields)
+        if isfield(info, fields{f}) && ~isempty(info.(fields{f}))
+            v = scalarize(info.(fields{f}));
+            if strcmp(fields{f}, 'ImagingFrequency')
+                v = v / 42.57747892;  % MHz -> Tesla
+            end
+            if isfinite(v) && v > 0 && v < 20
+                B0 = v;
+                return;
+            end
+        end
+    end
+end
+if isnan(B0)
+    B0 = 3;
+    warning('Could not detect B0 from DICOM; using fallback B0=3 T.');
+end
+end
+
+function B0_dir = detect_B0_dir(info)
+% Full oblique handling is outside this project. We keep [0 0 1] but store it
+% explicitly so downstream SEPIA receives a defined direction.
+B0_dir = [0 0 1];
+if isfield(info, 'B0_dir') && isnumeric(info.B0_dir) && numel(info.B0_dir) >= 3
+    tmp = double(info.B0_dir(1:3));
+    if all(isfinite(tmp)) && norm(tmp) > 0
+        B0_dir = tmp(:).' ./ norm(tmp);
+    end
+end
+end
+
+function spatial_res = get_spatial_res(info)
+ps = safe_field_any(info, 'PixelSpacing', [NaN NaN]);
+if isnumeric(ps) && numel(ps) >= 2
+    dy = double(ps(1));
+    dx = double(ps(2));
+else
+    dx = NaN; dy = NaN;
+end
+if isfield(info, 'SpacingBetweenSlices') && ~isempty(info.SpacingBetweenSlices)
+    dz = scalarize(info.SpacingBetweenSlices);
+else
+    dz = safe_dicom_num(info, 'SliceThickness', NaN);
+end
+spatial_res = [dx dy dz];
+end
+
+function pos = get_slice_position(info, default)
+pos = default;
+if isfield(info, 'ImagePositionPatient') && isnumeric(info.ImagePositionPatient) && numel(info.ImagePositionPatient) >= 3
+    pos = double(info.ImagePositionPatient(3));
+elseif isfield(info, 'SliceLocation') && ~isempty(info.SliceLocation)
+    pos = scalarize(info.SliceLocation);
+end
+if ~isfinite(pos)
+    pos = default;
+end
+end
+
+function v = safe_dicom_num(info, fname, default)
+v = default;
+if ~isfield(info, fname) || isempty(info.(fname)), return; end
+v = scalarize(info.(fname));
+if ~isfinite(v), v = default; end
+end
+
+function v = scalarize(x)
+if isnumeric(x) && ~isempty(x)
+    v = double(x(1));
+elseif iscell(x) && ~isempty(x)
+    v = scalarize(x{1});
+elseif ischar(x) && ~isempty(x)
+    v = str2double(x);
+elseif isstring(x) && ~isempty(x)
+    v = str2double(char(x(1)));
+else
+    v = NaN;
+end
+end
+
+function val = safe_field_any(info, fname, default)
+if isfield(info, fname) && ~isempty(info.(fname))
+    val = info.(fname);
+else
+    val = default;
+end
+end
+
+function v = safe_field_str(info, fname, default)
+v = default;
+if ~isfield(info, fname) || isempty(info.(fname)), return; end
+val = info.(fname);
+if isstruct(val)
+    parts = {};
+    fns = fieldnames(val);
+    for i = 1:numel(fns)
+        item = val.(fns{i});
+        if ischar(item) && ~isempty(item)
+            parts{end+1} = strtrim(item); %#ok<AGROW>
+        elseif isstring(item) && strlength(item) > 0
+            parts{end+1} = strtrim(char(item)); %#ok<AGROW>
+        end
+    end
+    if ~isempty(parts), v = strjoin(parts, ' '); end
+elseif ischar(val)
+    v = strtrim(val);
+elseif isstring(val)
+    v = strtrim(char(val));
+elseif iscell(val) && ~isempty(val)
+    v = safe_field_str(struct('x', val{1}), 'x', default);
+elseif isnumeric(val) && isscalar(val)
+    v = num2str(val);
+end
+end
+
+function s = image_type_to_string(v)
+if ischar(v)
+    s = v;
+elseif isstring(v)
+    s = char(join(v, '\'));
+elseif iscell(v)
+    parts = cell(size(v));
+    for i = 1:numel(v)
+        if ischar(v{i}), parts{i} = v{i}; else, parts{i} = ''; end
+    end
+    s = strjoin(parts, '\');
+else
+    s = '';
+end
+end
+
+function tf = contains_any(str, patterns)
+tf = false;
+for i = 1:numel(patterns)
+    if contains(str, patterns{i})
+        tf = true;
+        return;
+    end
+end
+end
+
+function out = get_info_or_empty(series)
+if isempty(series), out = []; else, out = series.info; end
+end
+
+function label = get_series_folder_label(file_paths)
+label = '';
+if isempty(file_paths)
+    return;
+end
+try
+    folder = fileparts(file_paths{1});
+    [~, label] = fileparts(folder);
+catch
+    label = '';
+end
+end
+
+function s = safe_series_no(info)
+v = safe_dicom_num(info, 'SeriesNumber', NaN);
+if isnan(v), s = '?'; else, s = sprintf('%g', v); end
+end
+
+function s = get_desc(info)
+s = safe_field_str(info, 'SeriesDescription', '');
+if isempty(s), s = safe_field_str(info, 'ProtocolName', ''); end
+if isempty(s), s = '<no description>'; end
+end
+
 %% =========================================================================
-function mask = generate_brain_mask(magn)
+% Mask / saving helpers
+% =========================================================================
+function mask = generate_brain_mask(magn, spatial_res, erode_mm, thr_factor, mask_method, bet_f, bet_g)
+% Generate an intracranial mask from SWI magnitude.
+%
+% Priority is to call mature toolbox brain extraction first (MEDI/SEPIA BET).
+% If unavailable or invalid, fallback to a conservative magnitude head mask
+% with physical erosion.
+
+if nargin < 2 || isempty(spatial_res), spatial_res = [1 1 1]; end
+if nargin < 3 || isempty(erode_mm), erode_mm = 1.5; end
+if nargin < 4 || isempty(thr_factor), thr_factor = 0.12; end
+if nargin < 5 || isempty(mask_method), mask_method = 'auto'; end
+if nargin < 6 || isempty(bet_f), bet_f = 0.50; end
+if nargin < 7 || isempty(bet_g), bet_g = 0.0; end
+
+magn = double(magn);
+magn(~isfinite(magn)) = 0;
 v = magn(:);
-v_max = prctile(v, 99);
-thr = 0.12 * v_max;
-mask = magn > thr;
-mask = imfill(mask, 'holes');
-se = strel('sphere', 2);
-mask = imerode(mask, se);
-mask = imdilate(mask, se);
+v = v(isfinite(v));
+if isempty(v) || max(v) <= 0
+    error('Magnitude is empty; cannot create mask.');
+end
 
-CC = bwconncomp(mask);
-if CC.NumObjects > 1
-    sizes = cellfun(@numel, CC.PixelIdxList);
-    [~, idx_max] = max(sizes);
-    mask = false(size(mask));
-    mask(CC.PixelIdxList{idx_max}) = true;
+mask_method = lower(char(mask_method));
+mask = [];
+used_method = '';
+
+if any(strcmp(mask_method, {'auto','toolbox_bet','bet'}))
+    [mask_bet, bet_info] = try_toolbox_bet_mask(magn, spatial_res, bet_f, bet_g);
+    if ~isempty(mask_bet)
+        mask = logical(mask_bet);
+        used_method = bet_info;
+        fprintf('  Brain extraction: %s\n', used_method);
+    elseif strcmp(mask_method, 'toolbox_bet') || strcmp(mask_method, 'bet')
+        error('Requested toolbox BET mask, but no usable BET implementation was found on MATLAB path.');
+    else
+        fprintf('  Toolbox BET unavailable/invalid; fallback to threshold+erosion mask.\n');
+    end
+end
+
+if isempty(mask)
+    thr = thr_factor * prctile(v, 99);
+    head_mask = magn > thr;
+    head_mask = imfill_safe(head_mask);
+    head_mask = largest_component(head_mask);
+    head_vox = nnz(head_mask);
+    head_ml = head_vox * prod(spatial_res) / 1000;
+    fprintf('  Initial head mask: %d voxels (%.1f mL), threshold=%.6g\n', head_vox, head_ml, thr);
+    mask = head_mask;
+    used_method = 'threshold_largest_component';
+end
+
+mask = imfill_safe(mask);
+mask = largest_component(mask);
+
+if erode_mm > 0
+    mask = erode_mask_mm(mask, spatial_res, erode_mm);
+    mask = imfill_safe(mask);
+    mask = largest_component(mask);
+    fprintf('  Final mask edge peel: %.3g mm.\n', erode_mm);
+else
+    fprintf('  Final mask edge peel disabled.\n');
+end
+
+mask = logical(mask);
+if nnz(mask) == 0
+    error('Generated brain mask is empty.');
+end
+
+mask_ml = nnz(mask) * prod(spatial_res) / 1000;
+fprintf('  Final WH-QSM mask method: %s\n', used_method);
+fprintf('  Final WH-QSM mask volume: %.1f mL\n', mask_ml);
+
+if mask_ml > 1800
+    warning('Mask volume is large (%.1f mL). Skull/scalp may still be included; consider stronger BET or increasing mask_erode_mm.', mask_ml);
+elseif mask_ml < 600
+    warning('Mask volume is small (%.1f mL). Cortex may be over-eroded; consider decreasing mask_erode_mm.', mask_ml);
 end
 end
 
-%% =========================================================================
-%% 内部: 重采样
-%% =========================================================================
+function [mask, info] = try_toolbox_bet_mask(magn, spatial_res, bet_f, bet_g)
+mask = [];
+info = '';
+if exist('BET', 'file') ~= 2
+    return;
+end
+
+matrix_size = size(magn);
+voxel_size = double(spatial_res(:).');
+func = str2func('BET');
+call_list = {
+    {@() func(magn, matrix_size, voxel_size, bet_f, bet_g), 'BET(mag,matrix_size,voxel_size,f,g)'}, ...
+    {@() func(magn, matrix_size, voxel_size, bet_f),        'BET(mag,matrix_size,voxel_size,f)'}, ...
+    {@() func(magn, matrix_size, voxel_size),               'BET(mag,matrix_size,voxel_size)'}, ...
+    {@() func(magn),                                       'BET(mag)'} ...
+    };
+
+for i = 1:numel(call_list)
+    try
+        out = call_list{i}{1}();
+        candidate = parse_bet_output(out);
+        if is_valid_mask_candidate(candidate, size(magn))
+            mask = logical(candidate);
+            mask = imfill_safe(mask);
+            mask = largest_component(mask);
+            info = call_list{i}{2};
+            return;
+        end
+    catch
+        % Try next known signature.
+    end
+end
+end
+
+function mask = parse_bet_output(out)
+mask = [];
+if isnumeric(out) || islogical(out)
+    mask = out;
+elseif isstruct(out)
+    fields = {'Mask','mask','BrainMask','brain_mask','msk'};
+    for i = 1:numel(fields)
+        if isfield(out, fields{i})
+            mask = out.(fields{i});
+            return;
+        end
+    end
+end
+end
+
+function tf = is_valid_mask_candidate(mask, target_size)
+tf = false;
+if isempty(mask) || ~isequal(size(mask), target_size)
+    return;
+end
+mask = logical(mask);
+frac = nnz(mask) / numel(mask);
+% Loose validity range: avoid all-head/all-empty failures.
+tf = frac > 0.05 && frac < 0.80;
+end
+
+function out = imfill_safe(mask)
+try
+    out = imfill(logical(mask), 'holes');
+catch
+    out = logical(mask);
+end
+end
+
+function out = erode_mask_mm(mask, spatial_res, erode_mm)
+spatial_res = double(spatial_res(:).');
+rx = max(1, ceil(erode_mm / spatial_res(1)));
+ry = max(1, ceil(erode_mm / spatial_res(2)));
+rz = max(1, ceil(erode_mm / spatial_res(3)));
+[x, y, z] = ndgrid(-rx:rx, -ry:ry, -rz:rz);
+se = (x*spatial_res(1)).^2 + (y*spatial_res(2)).^2 + (z*spatial_res(3)).^2 <= erode_mm^2;
+out = imerode(logical(mask), se);
+end
+
+function mask = largest_component(mask)
+mask = logical(mask);
+try
+    CC = bwconncomp(mask, 6);
+    if CC.NumObjects > 1
+        sizes = cellfun(@numel, CC.PixelIdxList);
+        [~, idx_max] = max(sizes);
+        tmp = false(size(mask));
+        tmp(CC.PixelIdxList{idx_max}) = true;
+        mask = tmp;
+    end
+catch
+    % Fallback: keep mask as-is if bwconncomp is unavailable for any reason.
+end
+end
+
 function out = resize_volume_nn(vol, target_size)
+vol = double(vol);
 sz = size(vol);
-out = zeros(target_size, 'double');
+if numel(sz) < 3, sz(3) = 1; end
+idx = cell(1,3);
 for d = 1:3
     if sz(d) == target_size(d)
         idx{d} = 1:sz(d);
     else
-        idx{d} = round(linspace(1, sz(d), target_size(d)));
+        idx{d} = max(1, min(sz(d), round(linspace(1, sz(d), target_size(d)))));
     end
 end
 out = vol(idx{1}, idx{2}, idx{3});
@@ -665,4 +1181,80 @@ end
 
 function p = wrap_to_pi(x)
 p = mod(x + pi, 2*pi) - pi;
+end
+
+function delta_TE = compute_delta_te(TE_sec)
+if numel(TE_sec) >= 2
+    d = diff(sort(TE_sec));
+    d = d(isfinite(d) & d > 0);
+    if ~isempty(d)
+        delta_TE = median(d);
+        return;
+    end
+end
+if numel(TE_sec) == 1
+    delta_TE = TE_sec(1);
+else
+    delta_TE = 0.025;
+end
+end
+
+function save_subject_variables(output_data_dir, data)
+if ~exist(output_data_dir, 'dir'), mkdir(output_data_dir); end
+
+phs_tissue = data.phs_tissue; %#ok<NASGU>
+phs_unwrap = data.phs_unwrap; %#ok<NASGU>
+phs_wrap = data.phs_wrap; %#ok<NASGU>
+fieldmap_Hz = data.fieldmap_Hz; %#ok<NASGU>
+local_field_ppm = data.local_field_ppm; %#ok<NASGU>
+R2star_Hz = data.R2star_Hz; %#ok<NASGU>
+R2star_s0 = data.R2star_s0; %#ok<NASGU>
+R2star_fit_residual = data.R2star_fit_residual; %#ok<NASGU>
+msk = data.msk; %#ok<NASGU>
+Mask = data.Mask; %#ok<NASGU>
+magn = data.magn; %#ok<NASGU>
+magn_raw = data.magn_raw; %#ok<NASGU>
+mp_rage = data.mp_rage; %#ok<NASGU>
+chi_33 = data.chi_33; %#ok<NASGU>
+chi_cosmos = data.chi_cosmos; %#ok<NASGU>
+spatial_res = data.spatial_res; %#ok<NASGU>
+evaluation_mask = data.evaluation_mask; %#ok<NASGU>
+echo_times_ms = data.echo_times_ms; %#ok<NASGU>
+echo_times_sec = data.echo_times_sec; %#ok<NASGU>
+delta_TE = data.delta_TE; %#ok<NASGU>
+B0 = data.B0; %#ok<NASGU>
+B0_dir = data.B0_dir; %#ok<NASGU>
+phase_fit_method = data.phase_fit_method; %#ok<NASGU>
+phase_conversion = data.phase_conversion; %#ok<NASGU>
+
+save(fullfile(output_data_dir, 'phs_tissue.mat'), 'phs_tissue');
+save(fullfile(output_data_dir, 'phs_unwrap.mat'), 'phs_unwrap');
+save(fullfile(output_data_dir, 'phs_wrap.mat'), 'phs_wrap');
+try
+    save(fullfile(output_data_dir, 'fieldmap_Hz.mat'), 'fieldmap_Hz', '-v7.3');
+    save(fullfile(output_data_dir, 'local_field_ppm.mat'), 'local_field_ppm', '-v7.3');
+    save(fullfile(output_data_dir, 'R2star_Hz.mat'), 'R2star_Hz', 'R2star_s0', 'R2star_fit_residual', '-v7.3');
+catch
+    save(fullfile(output_data_dir, 'fieldmap_Hz.mat'), 'fieldmap_Hz');
+    save(fullfile(output_data_dir, 'local_field_ppm.mat'), 'local_field_ppm');
+    save(fullfile(output_data_dir, 'R2star_Hz.mat'), 'R2star_Hz', 'R2star_s0', 'R2star_fit_residual');
+end
+save(fullfile(output_data_dir, 'msk.mat'), 'msk');
+save(fullfile(output_data_dir, 'Mask.mat'), 'Mask');
+save(fullfile(output_data_dir, 'magn.mat'), 'magn');
+save(fullfile(output_data_dir, 'magn_raw.mat'), 'magn_raw');
+save(fullfile(output_data_dir, 'mp_rage.mat'), 'mp_rage');
+save(fullfile(output_data_dir, 'chi_33.mat'), 'chi_33');
+save(fullfile(output_data_dir, 'chi_cosmos.mat'), 'chi_cosmos');
+save(fullfile(output_data_dir, 'spatial_res.mat'), 'spatial_res');
+save(fullfile(output_data_dir, 'evaluation_mask.mat'), 'evaluation_mask');
+save(fullfile(output_data_dir, 'dicom_whqsm_metadata.mat'), ...
+    'echo_times_ms', 'echo_times_sec', 'delta_TE', 'B0', 'B0_dir', ...
+    'phase_fit_method', 'phase_conversion');
+try
+    save(fullfile(output_data_dir, 'data_full.mat'), 'data', '-v7.3');
+catch
+    save(fullfile(output_data_dir, 'data_full.mat'), 'data');
+end
+fprintf('  Saved WH-QSM input variables to: %s\n', output_data_dir);
 end

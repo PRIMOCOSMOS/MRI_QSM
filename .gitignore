@@ -29,7 +29,9 @@ output_QSM2016_MEDI_complete/
 utils/             
 results/           
 temp/             
-cache/              
+cache/
+Dependencies_x64_Release/
+Chi*/              
 
 # MATLAB App Designer
 *.mlapp.autosave   

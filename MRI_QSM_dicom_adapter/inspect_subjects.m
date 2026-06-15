@@ -170,10 +170,10 @@ for k = 1:length(subject_roots)
         fprintf('  → 猜测分组: %s\n', group_guess);
     end
     id_l = lower([pid ' ' pname]);
-    if contains(id_l, {'old','elder','aged','senior'})
+    if contains_any_local(id_l, {'old','elder','aged','senior'})
         group_guess = 'ELDERLY';
         fprintf('  → ID 含 old/elder: 强制 ELDERLY\n');
-    elseif contains(id_l, {'young','control','normal'})
+    elseif contains_any_local(id_l, {'young','control','normal'})
         group_guess = 'NORMAL';
         fprintf('  → ID 含 normal/control: 强制 NORMAL\n');
     end
@@ -285,5 +285,15 @@ if ischar(val)
     v = strtrim(val);
 elseif isstring(val)
     v = strtrim(char(val));
+end
+end
+
+function tf = contains_any_local(str, patterns)
+tf = false;
+for i = 1:numel(patterns)
+    if contains(str, patterns{i})
+        tf = true;
+        return;
+    end
 end
 end

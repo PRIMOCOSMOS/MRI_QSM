@@ -1,31 +1,28 @@
 function compare_subjects(results_normal, results_elderly, output_dir)
-% compare_subjects.m
+% compare_subjects.m (v5 - WH-QSM QC visualisation, no subtraction)
 % ============================================================================
-%   正常 vs 老年人 对比分析
+% Conservative QC visualisation for two real-subject WH-QSM outputs.
 %
-%   输入:
-%     results_normal  : 结构体，含 .chi (QSM 结果), .name, .mask
-%     results_elderly : 同上
-%     output_dir      : 输出目录
-%
-%   分析内容:
-%     1. 三平面 QSM 对比（侧视图、冠状、轴状）
-%     2. ROI 分析（深部灰质核团 — 铁沉积敏感区域）
-%     3. 直方图对比
-%     4. 差值图
+% This function intentionally does NOT compute elderly-normal voxel-wise
+% subtraction. Without registration, subtraction is not valid. Visual outputs:
+%   1) per-subject QC panels: magnitude / field map / QSM in native space
+%   2) side-by-side WH-QSM three-plane view
+%   3) within-mask histograms
+%   4) descriptive CSV/MAT summary
 % ============================================================================
 
 if nargin < 3 || isempty(output_dir)
     output_dir = pwd;
 end
-
-if ~exist(output_dir, 'dir'), mkdir(output_dir); end
+if ~exist(output_dir, 'dir')
+    mkdir(output_dir);
+end
 
 fprintf('============================================================\n');
-fprintf(' 被试对比分析 - 正常 vs 老年人\n');
-fprintf(' 正常: %s\n', results_normal.name);
-fprintf(' 老年: %s\n', results_elderly.name);
-fprintf(' 输出: %s\n', output_dir);
+fprintf(' WH-QSM two-subject QC summary (no subtraction)\n');
+fprintf(' NORMAL : %s\n', results_normal.name);
+fprintf(' ELDERLY: %s\n', results_elderly.name);
+fprintf(' Output : %s\n', output_dir);
 fprintf('============================================================\n\n');
 
 chi_n = double(results_normal.chi);
@@ -33,253 +30,281 @@ chi_e = double(results_elderly.chi);
 mask_n = logical(results_normal.mask);
 mask_e = logical(results_elderly.mask);
 
-% 公共 mask（两个都被试覆盖的区域）
-common_mask = mask_n & mask_e;
-fprintf('公共 mask 体素: %d (normal: %d, elderly: %d)\n', ...
-    nnz(common_mask), nnz(mask_n), nnz(mask_e));
+if ~isequal(size(chi_n), size(mask_n)) || ~isequal(size(chi_e), size(mask_e))
+    error('QSM and mask sizes do not match for at least one subject.');
+end
 
-%% ====== 对比 1: 三平面 QSM 图 ======
-fprintf('\n[1/4] 三平面 QSM 对比...\n');
+qsm_clim = [-0.15 0.15];
+field_clim = [-0.20 0.20];
 
-% 选中间层
-[Nx, Ny, Nz] = size(chi_n);
-slice_x = round(Nx/2);
-slice_y = round(Ny/2);
-slice_z = round(Nz/2);
+%% 1. Per-subject QC panels
+fprintf('[1/4] Per-subject QC panels...\n');
+fig = subject_qc_panel(results_normal, 'NORMAL', qsm_clim, field_clim);
+save_figure(fig, fullfile(output_dir, 'qc_normal_native_space.png'));
+fprintf('  -> %s\n', fullfile(output_dir, 'qc_normal_native_space.png'));
 
-% 显示范围
-clim = [-0.15 0.15];  % ppm
+fig = subject_qc_panel(results_elderly, 'ELDERLY', qsm_clim, field_clim);
+save_figure(fig, fullfile(output_dir, 'qc_elderly_native_space.png'));
+fprintf('  -> %s\n', fullfile(output_dir, 'qc_elderly_native_space.png'));
 
-figure('Name', '三平面 QSM 对比', 'Position', [50 50 1600 900]);
+%% 2. Side-by-side 3-plane display
+fprintf('\n[2/4] Side-by-side WH-QSM three-plane display...\n');
+fig = figure('Name', 'WH-QSM side-by-side 3-plane QC', 'Position', [50 50 1600 900], 'Color', 'w');
 
-% 正常被试
-subplot(2, 3, 1);
-imagesc(squeeze(chi_n(:, :, slice_z))' .* squeeze(mask_n(:, :, slice_z))');
-axis image off; colormap(gca, redblue_cmap_local); caxis(clim);
-title(sprintf('NORMAL: 轴状层 z=%d', slice_z), 'FontSize', 12);
+plot_subject_3planes(chi_n, mask_n, results_normal, 1, qsm_clim, 'NORMAL');
+plot_subject_3planes(chi_e, mask_e, results_elderly, 4, qsm_clim, 'ELDERLY');
 
-subplot(2, 3, 2);
-imagesc(squeeze(chi_n(:, slice_y, :))');
-axis image off; colormap(gca, redblue_cmap_local); caxis(clim);
-title(sprintf('NORMAL: 冠状层 y=%d', slice_y), 'FontSize', 12);
-
-subplot(2, 3, 3);
-imagesc(squeeze(chi_n(slice_x, :, :))');
-axis image off; colormap(gca, redblue_cmap_local); caxis(clim);
-title(sprintf('NORMAL: 矢状层 x=%d', slice_x), 'FontSize', 12);
-
-% 老年人被试
-subplot(2, 3, 4);
-imagesc(squeeze(chi_e(:, :, slice_z))' .* squeeze(mask_e(:, :, slice_z))');
-axis image off; colormap(gca, redblue_cmap_local); caxis(clim);
-title(sprintf('ELDERLY: 轴状层 z=%d', slice_z), 'FontSize', 12);
-
-subplot(2, 3, 5);
-imagesc(squeeze(chi_e(:, slice_y, :))');
-axis image off; colormap(gca, redblue_cmap_local); caxis(clim);
-title(sprintf('ELDERLY: 冠状层 y=%d', slice_y), 'FontSize', 12);
-
-subplot(2, 3, 6);
-imagesc(squeeze(chi_e(slice_x, :, :))');
-axis image off; colormap(gca, redblue_cmap_local); caxis(clim);
-title(sprintf('ELDERLY: 矢状层 x=%d', slice_x), 'FontSize', 12);
-
-% 添加公共 colorbar
-colormap(redblue_cmap_local);
-cb = colorbar('Position', [0.92 0.1 0.015 0.8]);
+colormap(redblue_cmap_local(256));
+cb = colorbar('Position', [0.93 0.12 0.015 0.76]);
 cb.Label.String = 'Susceptibility (ppm)';
 cb.Label.FontSize = 12;
+sgtitle('WH-QSM QC: side-by-side native-space views (no registration / no subtraction)', ...
+    'FontSize', 14, 'Interpreter', 'none');
 
-sgtitle(sprintf('WH-QSM QSM 对比: 正常 vs 老年人 (公共 mask 内)'), 'FontSize', 14);
+save_figure(fig, fullfile(output_dir, 'compare_3view.png'));
+saveas(fig, fullfile(output_dir, 'compare_3view.fig'));
+fprintf('  -> %s\n', fullfile(output_dir, 'compare_3view.png'));
 
-saveas(gcf, fullfile(output_dir, 'compare_3view.png'));
-saveas(gcf, fullfile(output_dir, 'compare_3view.fig'));
-fprintf('  -> 保存: %s\n', fullfile(output_dir, 'compare_3view.png'));
+%% 3. Histogram / distribution summary inside each subject mask
+fprintf('\n[3/4] Within-mask histograms...\n');
+vals_n = chi_n(mask_n);
+vals_e = chi_e(mask_e);
+vals_n = vals_n(isfinite(vals_n));
+vals_e = vals_e(isfinite(vals_e));
 
-%% ====== 对比 2: 深部灰质 ROI 分析 ======
-fprintf('\n[2/4] 深部灰质 ROI 分析 (铁沉积敏感区域)...\n');
-
-% 自动定义 ROIs（深部灰质核团 — 用简单阈值法）
-% 这些区域铁含量高，QSM 表现为高信号（正磁化率）
-% Globus Pallidus (GP), Putamen (PU), Caudate Nucleus (CN), Thalamus (TH)
-ROIs = define_basal_ganglia_rois(chi_n, mask_n);
-
-roi_names = fieldnames(ROIs);
-fprintf('  ROI 定义: %s\n', strjoin(roi_names, ', '));
-
-% 提取每个 ROI 的平均磁化率
-roi_values_normal = zeros(length(roi_names), 1);
-roi_values_elderly = zeros(length(roi_names), 1);
-
-for k = 1:length(roi_names)
-    rn = roi_names{k};
-    roi_n = ROIs.(rn) & mask_n;
-    roi_e = ROIs.(rn) & mask_e;
-    roi_values_normal(k) = mean(chi_n(roi_n));
-    roi_values_elderly(k) = mean(chi_e(roi_e));
-end
-
-% 绘制 ROI 对比柱状图
-figure('Name', '深部灰质 ROI 对比', 'Position', [100 100 1200 600]);
-bar_data = [roi_values_normal, roi_values_elderly];
-b = bar(bar_data);
-b(1).FaceColor = [0.2 0.6 0.8];
-b(2).FaceColor = [0.8 0.4 0.2];
-set(gca, 'XTickLabel', roi_names, 'FontSize', 12);
-ylabel('Mean Susceptibility (ppm)', 'FontSize', 13);
-title('深部灰质核团 QSM 对比 (正常 vs 老年人)', 'FontSize', 14);
-legend({'NORMAL', 'ELDERLY'}, 'FontSize', 12);
+fig = figure('Name', 'WH-QSM within-mask histogram', 'Position', [100 100 1100 650], 'Color', 'w');
+edges = linspace(-0.3, 0.4, 100);
+histogram(vals_n, edges, 'FaceColor', [0.2 0.55 0.85], 'FaceAlpha', 0.55, 'DisplayName', 'NORMAL');
+hold on;
+histogram(vals_e, edges, 'FaceColor', [0.85 0.40 0.20], 'FaceAlpha', 0.55, 'DisplayName', 'ELDERLY');
+hold off;
+xlabel('Susceptibility (ppm)', 'FontSize', 13);
+ylabel('Voxel count', 'FontSize', 13);
+title('WH-QSM within-mask susceptibility distribution', 'FontSize', 14);
+legend('FontSize', 12);
 grid on;
 
-% 标注差值
-for k = 1:length(roi_names)
-    diff_val = roi_values_elderly(k) - roi_values_normal(k);
-    text(k, max(bar_data(k,:)) + 0.005, sprintf('Δ=%.3f', diff_val), ...
-        'HorizontalAlignment', 'center', 'FontSize', 11);
+sn = summary_stats(vals_n);
+se = summary_stats(vals_e);
+annotation('textbox', [0.58 0.66 0.32 0.20], 'String', sprintf( ...
+    ['NORMAL:  mean %.4f, std %.4f, median %.4f\n' ...
+     'ELDERLY: mean %.4f, std %.4f, median %.4f\n' ...
+     'Note: descriptive native-space QC only'], ...
+     sn.mean, sn.std, sn.median, se.mean, se.std, se.median), ...
+    'FitBoxToText', 'on', 'BackgroundColor', 'w', 'EdgeColor', [0.7 0.7 0.7]);
+
+save_figure(fig, fullfile(output_dir, 'compare_histogram.png'));
+saveas(fig, fullfile(output_dir, 'compare_histogram.fig'));
+fprintf('  -> %s\n', fullfile(output_dir, 'compare_histogram.png'));
+
+%% 4. Save descriptive summary CSV / MAT
+fprintf('\n[4/4] Saving descriptive summaries...\n');
+summary_table = build_summary_table(results_normal, vals_n, results_elderly, vals_e);
+try
+    writetable(summary_table, fullfile(output_dir, 'subject_summary.csv'));
+    fprintf('  -> %s\n', fullfile(output_dir, 'subject_summary.csv'));
+catch ME
+    warning('Could not write subject_summary.csv: %s', ME.message);
 end
 
-saveas(gcf, fullfile(output_dir, 'compare_roi_basal_ganglia.png'));
-saveas(gcf, fullfile(output_dir, 'compare_roi_basal_ganglia.fig'));
-fprintf('  -> 保存: %s\n', fullfile(output_dir, 'compare_roi_basal_ganglia.png'));
+results = struct();
+results.normal = results_normal;
+results.elderly = results_elderly;
+results.normal_stats = sn;
+results.elderly_stats = se;
+save(fullfile(output_dir, 'all_results.mat'), 'results', 'summary_table', '-v7.3');
+fprintf('  -> %s\n', fullfile(output_dir, 'all_results.mat'));
 
-% 打印 ROI 数值
-fprintf('\n  ROI 均值磁化率 (ppm):\n');
-fprintf('  %-15s %-12s %-12s %-12s\n', 'ROI', 'NORMAL', 'ELDERLY', '差值 (老-正)');
-fprintf('  %s\n', repmat('-', 1, 55));
-for k = 1:length(roi_names)
-    fprintf('  %-15s %-12.4f %-12.4f %-12.4f\n', ...
-        roi_names{k}, roi_values_normal(k), roi_values_elderly(k), ...
-        roi_values_elderly(k) - roi_values_normal(k));
-end
+fprintf('\nDescriptive WH-QSM summary:\n');
+fprintf('  %-8s %-10s %-10s %-10s %-10s %-10s %-10s %-10s\n', ...
+    'Group', 'Nvox', 'Mean', 'Std', 'Median', 'P05', 'P95', 'P99');
+fprintf('  %s\n', repmat('-', 1, 82));
+fprintf('  %-8s %-10d %-10.5f %-10.5f %-10.5f %-10.5f %-10.5f %-10.5f\n', ...
+    'NORMAL', sn.n, sn.mean, sn.std, sn.median, sn.p05, sn.p95, sn.p99);
+fprintf('  %-8s %-10d %-10.5f %-10.5f %-10.5f %-10.5f %-10.5f %-10.5f\n', ...
+    'ELDERLY', se.n, se.mean, se.std, se.median, se.p05, se.p95, se.p99);
 
-%% ====== 对比 3: 直方图对比 ======
-fprintf('\n[3/4] QSM 磁化率值分布直方图...\n');
-
-figure('Name', '磁化率值分布', 'Position', [150 150 1000 600]);
-
-chi_n_vals = chi_n(common_mask);
-chi_e_vals = chi_e(common_mask);
-
-edges = linspace(-0.2, 0.3, 80);
-histogram(chi_n_vals, edges, 'FaceColor', [0.2 0.6 0.8], ...
-    'FaceAlpha', 0.6, 'DisplayName', 'NORMAL');
-hold on;
-histogram(chi_e_vals, edges, 'FaceColor', [0.8 0.4 0.2], ...
-    'FaceAlpha', 0.6, 'DisplayName', 'ELDERLY');
-hold off;
-
-xlabel('Susceptibility (ppm)', 'FontSize', 13);
-ylabel('Voxel Count', 'FontSize', 13);
-title('QSM 磁化率值分布对比', 'FontSize', 14);
-legend('FontSize', 12); grid on;
-
-% 标注统计量
-mn = mean(chi_n_vals); me = mean(chi_e_vals);
-sn = std(chi_n_vals);  se = std(chi_e_vals);
-text(0.05, 0.95, sprintf('NORMAL  : μ=%.4f, σ=%.4f', mn, sn), ...
-    'Units', 'normalized', 'FontSize', 11, 'Color', [0.2 0.4 0.6]);
-text(0.05, 0.88, sprintf('ELDERLY : μ=%.4f, σ=%.4f', me, se), ...
-    'Units', 'normalized', 'FontSize', 11, 'Color', [0.7 0.3 0.1]);
-
-saveas(gcf, fullfile(output_dir, 'compare_histogram.png'));
-saveas(gcf, fullfile(output_dir, 'compare_histogram.fig'));
-fprintf('  -> 保存: %s\n', fullfile(output_dir, 'compare_histogram.png'));
-
-fprintf('  NORMAL  均值=%.4f, 标准差=%.4f\n', mn, sn);
-fprintf('  ELDERLY 均值=%.4f, 标准差=%.4f\n', me, se);
-
-%% ====== 对比 4: 差值图（elderly - normal）======
-fprintf('\n[4/4] 差值图 (elderly - normal)...\n');
-
-% 在公共 mask 上做差值
-diff_map = zeros(size(chi_n));
-diff_map(common_mask) = chi_e(common_mask) - chi_n(common_mask);
-
-% 显示
-figure('Name', '差值图', 'Position', [200 200 1200 400]);
-subplot(1, 3, 1);
-imagesc(squeeze(diff_map(:,:,slice_z))' .* squeeze(common_mask(:,:,slice_z))');
-axis image off; colormap(gca, redblue_cmap_local); caxis([-0.1 0.1]);
-title(sprintf('轴状层 z=%d', slice_z), 'FontSize', 12);
-subplot(1, 3, 2);
-imagesc(squeeze(diff_map(:,slice_y,:))');
-axis image off; colormap(gca, redblue_cmap_local); caxis([-0.1 0.1]);
-title(sprintf('冠状层 y=%d', slice_y), 'FontSize', 12);
-subplot(1, 3, 3);
-imagesc(squeeze(diff_map(slice_x,:,:))');
-axis image off; colormap(gca, redblue_cmap_local); caxis([-0.1 0.1]);
-title(sprintf('矢状层 x=%d', slice_x), 'FontSize', 12);
-
-colormap(redblue_cmap_local);
-cb = colorbar;
-cb.Label.String = 'Δ Susceptibility (ppm, elderly - normal)';
-cb.Label.FontSize = 12;
-sgtitle('差值图 (老年人 - 正常人): 红色=铁沉积增加', 'FontSize', 14);
-
-saveas(gcf, fullfile(output_dir, 'compare_diff_map.png'));
-saveas(gcf, fullfile(output_dir, 'compare_diff_map.fig'));
-fprintf('  -> 保存: %s\n', fullfile(output_dir, 'compare_diff_map.png'));
-
-%% ====== 保存数值结果 ======
-fprintf('\n保存数值结果...\n');
-
-results_table = table();
-results_table.ROI = roi_names;
-results_table.Normal = roi_values_normal;
-results_table.Elderly = roi_values_elderly;
-results_table.Diff = roi_values_elderly - roi_values_normal;
-
-writetable(results_table, fullfile(output_dir, 'roi_comparison.csv'));
-fprintf('  -> CSV: %s\n', fullfile(output_dir, 'roi_comparison.csv'));
-
-% 全局统计
-global_stats = struct( ...
-    'mean_normal', mn, ...
-    'std_normal', sn, ...
-    'mean_elderly', me, ...
-    'std_elderly', se, ...
-    'mean_diff', me - mn);
-save(fullfile(output_dir, 'global_stats.mat'), 'global_stats');
-fprintf('  -> MAT: %s\n', fullfile(output_dir, 'global_stats.mat'));
-
-fprintf('\n✅ 对比分析完成！\n');
+fprintf('\n✅ WH-QSM QC summary complete. No voxel-wise subtraction was generated.\n');
 end
 
 %% =========================================================================
-% 内部: 简单的基底神经节 ROI 定义
-% =========================================================================
-function ROIs = define_basal_ganglia_rois(chi, mask)
-% 简化版：用磁化率阈值在深部灰质区域定义 ROI
-% Globus Pallidus (GP): 高 χ (>0.15 ppm)
-% Putamen (PU): 中高 χ (0.08-0.18 ppm)
-% Caudate (CN): 中 χ (0.05-0.12 ppm)
-% Thalamus (TH): 中 χ (0.03-0.10 ppm)
-% White Matter (WM): 负 χ (<-0.02 ppm)
+function fig = subject_qc_panel(result, label, qsm_clim, field_clim)
+chi = double(result.chi);
+mask = logical(result.mask);
+mag = getfield_or(result, 'magn', double(mask));
+field_ppm = getfield_or(result, 'local_field_ppm', zeros(size(mask)));
+mag = double(mag);
+field_ppm = double(field_ppm);
 
-chi_in = chi .* double(mask);
+[sx, sy, sz] = mask_center_slices(mask);
 
-ROIs = struct();
-ROIs.GP = (chi_in > 0.10) & mask;
-ROIs.PU = (chi_in > 0.05) & (chi_in <= 0.12) & mask;
-ROIs.CN = (chi_in > 0.02) & (chi_in <= 0.08) & mask;
-ROIs.TH = (chi_in > 0.0)  & (chi_in <= 0.06) & mask;
-ROIs.WM = (chi_in < -0.02) & mask;
-ROIs.GM = (chi_in > -0.01) & (chi_in <= 0.02) & mask;
+fig = figure('Name', ['WH-QSM QC ' label], 'Position', [60 60 1650 850], 'Color', 'w');
+tiledlayout(2,4, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+% Row 1: axial QC at mask centre
+nexttile; show_gray_slice(mag(:,:,sz), mask(:,:,sz)); title(sprintf('%s magnitude axial z=%d', label, sz), 'Interpreter','none');
+nexttile; show_mask_slice(mask(:,:,sz)); title('Brain mask axial', 'Interpreter','none');
+nexttile; show_color_slice(field_ppm(:,:,sz), mask(:,:,sz), field_clim, redblue_cmap_local(256)); title('Input field ppm axial', 'Interpreter','none'); colorbar;
+nexttile; show_color_slice(chi(:,:,sz), mask(:,:,sz), qsm_clim, redblue_cmap_local(256)); title('WH-QSM ppm axial', 'Interpreter','none'); colorbar;
+
+% Row 2: WH-QSM three planes
+nexttile; show_color_slice(chi(:,:,sz), mask(:,:,sz), qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM axial z=%d', sz), 'Interpreter','none');
+nexttile; show_color_slice(squeeze(chi(:,sy,:)), squeeze(mask(:,sy,:)), qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM coronal y=%d', sy), 'Interpreter','none');
+nexttile; show_color_slice(squeeze(chi(sx,:,:)), squeeze(mask(sx,:,:)), qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM sagittal x=%d', sx), 'Interpreter','none');
+nexttile; axis off;
+st = summary_stats(chi(mask));
+text(0, 0.95, sprintf('%s: %s', label, result.name), 'FontWeight','bold', 'Interpreter','none');
+text(0, 0.82, sprintf('Matrix: %s', mat2str(size(mask))), 'Interpreter','none');
+text(0, 0.72, sprintf('Voxel: %s mm', mat2str(getfield_or(result,'spatial_res',[]), 5)), 'Interpreter','none');
+text(0, 0.62, sprintf('TE: %s ms', mat2str(getfield_or(result,'echo_times_ms',[]), 5)), 'Interpreter','none');
+text(0, 0.52, sprintf('B0: %.3g T', getfield_or(result,'B0',NaN)), 'Interpreter','none');
+text(0, 0.42, sprintf('Fit: %s', getfield_or(result,'phase_fit_method','')), 'Interpreter','none');
+text(0, 0.28, sprintf('QSM p01/p99: %.3f / %.3f ppm', st.p01, st.p99), 'Interpreter','none');
+text(0, 0.18, sprintf('QSM mean/std: %.4f / %.4f ppm', st.mean, st.std), 'Interpreter','none');
+
+sgtitle(sprintf('WH-QSM native-space QC: %s (no registration)', label), 'Interpreter','none');
 end
 
 %% =========================================================================
-% 内部: 红蓝发散色图
-%% =========================================================================
+function plot_subject_3planes(chi, mask, result, start_subplot, clim, label)
+[slice_x, slice_y, slice_z] = mask_center_slices(mask);
+
+subtitle = sprintf('%s: %s | TE=%s ms | B0=%.3gT', ...
+    label, result.name, mat2str(getfield_or(result, 'echo_times_ms', []), 5), getfield_or(result, 'B0', NaN));
+
+subplot(2,3,start_subplot);
+show_color_slice(chi(:,:,slice_z), mask(:,:,slice_z), clim, redblue_cmap_local(256));
+title(sprintf('%s axial z=%d', label, slice_z), 'Interpreter', 'none');
+ylabel(subtitle, 'Interpreter', 'none', 'FontSize', 9);
+
+subplot(2,3,start_subplot+1);
+show_color_slice(squeeze(chi(:,slice_y,:)), squeeze(mask(:,slice_y,:)), clim, redblue_cmap_local(256));
+title(sprintf('%s coronal y=%d', label, slice_y), 'Interpreter', 'none');
+
+subplot(2,3,start_subplot+2);
+show_color_slice(squeeze(chi(slice_x,:,:)), squeeze(mask(slice_x,:,:)), clim, redblue_cmap_local(256));
+title(sprintf('%s sagittal x=%d', label, slice_x), 'Interpreter', 'none');
+end
+
+function [sx, sy, sz] = mask_center_slices(mask)
+idx = find(mask);
+if isempty(idx)
+    sz0 = size(mask);
+    sx = round(sz0(1)/2); sy = round(sz0(2)/2); sz = round(sz0(3)/2);
+    return;
+end
+[x, y, z] = ind2sub(size(mask), idx);
+sx = round(mean(x)); sy = round(mean(y)); sz = round(mean(z));
+sz0 = size(mask);
+sx = max(1, min(sz0(1), sx));
+sy = max(1, min(sz0(2), sy));
+sz = max(1, min(sz0(3), sz));
+end
+
+function show_color_slice(img, mask, clim, cmap)
+img = rot90(squeeze(img));
+mask = rot90(squeeze(mask));
+h = imagesc(img, clim);
+set(h, 'AlphaData', double(mask));
+axis image off;
+set(gca, 'Color', [0 0 0]);
+colormap(gca, cmap);
+end
+
+function show_gray_slice(img, mask)
+img = rot90(squeeze(img));
+mask = rot90(squeeze(mask));
+v = img(mask > 0);
+v = v(isfinite(v));
+if isempty(v)
+    clim = [min(img(:)) max(img(:))];
+else
+    clim = [prctile(v, 1) prctile(v, 99.5)];
+end
+if clim(1) == clim(2), clim = clim + [-1 1]; end
+h = imagesc(img, clim);
+set(h, 'AlphaData', double(mask));
+axis image off;
+set(gca, 'Color', [0 0 0]);
+colormap(gca, gray(256));
+end
+
+function show_mask_slice(mask)
+imagesc(rot90(squeeze(mask)), [0 1]);
+axis image off;
+colormap(gca, gray(2));
+end
+
+function save_figure(fig, filename)
+try
+    drawnow;
+    exportgraphics(fig, filename, 'Resolution', 200);
+catch
+    saveas(fig, filename);
+end
+end
+
+function st = summary_stats(vals)
+vals = vals(:);
+vals = vals(isfinite(vals));
+st = struct();
+st.n = numel(vals);
+if isempty(vals)
+    st.mean = NaN; st.std = NaN; st.median = NaN; st.min = NaN; st.max = NaN;
+    st.p01 = NaN; st.p05 = NaN; st.p95 = NaN; st.p99 = NaN;
+    return;
+end
+st.mean = mean(vals);
+st.std = std(vals);
+st.median = median(vals);
+st.min = min(vals);
+st.max = max(vals);
+st.p01 = prctile(vals, 1);
+st.p05 = prctile(vals, 5);
+st.p95 = prctile(vals, 95);
+st.p99 = prctile(vals, 99);
+end
+
+function T = build_summary_table(rn, vals_n, re, vals_e)
+sn = summary_stats(vals_n);
+se = summary_stats(vals_e);
+Subject = {rn.name; re.name};
+Group = {'NORMAL'; 'ELDERLY'};
+Method = {getfield_or(rn, 'qsm_method', 'WH-QSM'); getfield_or(re, 'qsm_method', 'WH-QSM')};
+B0_T = [getfield_or(rn, 'B0', NaN); getfield_or(re, 'B0', NaN)];
+DeltaTE_ms = [getfield_or(rn, 'delta_TE_sec', NaN); getfield_or(re, 'delta_TE_sec', NaN)] * 1000;
+PhaseFit = {getfield_or(rn, 'phase_fit_method', ''); getfield_or(re, 'phase_fit_method', '')};
+Nvox = [sn.n; se.n];
+Mean = [sn.mean; se.mean];
+Std = [sn.std; se.std];
+Median = [sn.median; se.median];
+Min = [sn.min; se.min];
+P01 = [sn.p01; se.p01];
+P05 = [sn.p05; se.p05];
+P95 = [sn.p95; se.p95];
+P99 = [sn.p99; se.p99];
+Max = [sn.max; se.max];
+T = table(Subject, Group, Method, B0_T, DeltaTE_ms, PhaseFit, Nvox, ...
+    Mean, Std, Median, Min, P01, P05, P95, P99, Max);
+end
+
+function v = getfield_or(s, name, default)
+if isstruct(s) && isfield(s, name) && ~isempty(s.(name))
+    v = s.(name);
+else
+    v = default;
+end
+end
+
 function cmap = redblue_cmap_local(n)
 if nargin < 1, n = 256; end
-neg = linspace(0, 1, n/2)';
-pos = linspace(1, 0, n/2)';
+n1 = floor(n/2);
+n2 = n - n1;
 blue = [0.05 0.18 0.68];
-gray = [0.92 0.92 0.92];
-red  = [0.72 0.05 0.05];
-
-cmap = [blue + (gray-blue).*neg(1:end-1); ...
-        gray; ...
-        gray + (red-gray).*pos(2:end)];
+white = [0.96 0.96 0.96];
+red = [0.72 0.05 0.05];
+a = linspace(0, 1, n1)';
+b = linspace(0, 1, n2)';
+cmap = [blue + (white-blue).*a; white + (red-white).*b];
 cmap = max(min(cmap, 1), 0);
 end

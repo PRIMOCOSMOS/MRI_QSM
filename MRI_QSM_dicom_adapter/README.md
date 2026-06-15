@@ -1,118 +1,149 @@
-# MRI_QSM dicom_adapter 扩展模块  (v3)
+# MRI_QSM DICOM Adapter — WH-QSM-only real subject pipeline (v4)
 
-> 用于处理 Siemens SWI DICOM 数据并执行 WH-QSM 重建 + 正常 vs 老年人 对比分析
->
-> **核心原则（按用户要求）**：最大限度复用原库方法，调用 SEPIA/FANSI 工具箱，不自己手写 WH-QSM
+本目录现在只服务一个目标：**把两个真实 DICOM 被试稳定跑 WH-QSM**。旧的 TKD / CFL2 / iLSQR / MEDI / xQSM 对比属于算法测试 Pipeline，不再在真实被试流程中重复运行。
 
-## 一键运行
+## 一键运行（推荐）
+
+所有固化路径集中在：
 
 ```matlab
-% 默认路径
-run_whqsm_comparison()
-
-% 自定义数据路径
-run_whqsm_comparison('D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge\data_course')
-
-% 同时指定原库路径
-run_whqsm_comparison('D:\path\data_course', 'D:\path\MRI_QSM')
-
-% 跳过 SEPIA 检查（仅用于离线调试）
-run_whqsm_comparison(..., 'skip_sepia_check', true)
+MRI_QSM_dicom_adapter/whqsm_local_paths.m
 ```
 
-## 模块清单
+默认已经固化为：
 
-| 文件 | 版本 | 职责 |
-|---|---|---|
-| `run_whqsm_comparison.m` | v3 | 🚀 主入口（预检查 + SEPIA 复用 + 容错） |
-| `discover_subjects.m` | v1 | 🔍 自动发现 NORMAL/ELDERLY 被试 |
-| `dicom_loader_subject.m` | v2 | 🏥 DICOM → QSM2016 .mat（含 rad→ppm 转换） |
-| `compare_subjects.m` | v1 | 🆚 正常 vs 老年人 对比 + 可视化 |
-| `SWI202606_dicom_scanner.m` | v4 | 🔬 DICOM 元信息扫描（诊断工具） |
-| `setup.m` | 🆕 | ⚙️ 一键配置路径 |
-| `test_pipeline.m` | 🆕 | 🧪 快速测试（无需 SEPIA） |
-
-## 架构（v3 增强）
-
-```
-run_whqsm_comparison()
-        │
-        ▼
-[Init] 预检查
-        ├── check_original_library (mod_dipole_inversion, mod_background_removal)
-        ├── check_sepia_toolbox (QSMMacroIOWrapper)
-        ├── check_image_processing_toolbox (niftiwrite)
-        └── 路径自动配置
-        │
-        ▼
-[1] discover_subjects → 找到 NORMAL + ELDERLY
-        │
-        ▼
-[2] 对每个被试 (try/catch 容错):
-    ┌─ dicom_loader_subject (v2)
-    │     ├── 读 DICOM (Phase Ser#16, Mag Ser#14, T1 Ser#8)
-    │     ├── 应用 Siemens 缩放: phase_rad = pixel × slope + intercept
-    │     ├── 🔴 rad → ppm 转换 (关键!)
-    │     ├── 多回波平均 magnitude
-    │     └── 输出 11 个 .mat + data_full.mat
-    │
-    ├─ mod_background_removal  ◀══ 【复用原库】
-    │
-    ├─ mod_dipole_inversion    ◀══ 【复用原库】
-    │     └── 调用 inversion_whqsm_stable (内嵌 subfunction)
-    │           └── SEPIA QSMMacroIOWrapper + FANSI(isWeakHarmonic=true)
-    │
-    └─ 提取 qsm_results(:,:,:,idx_whqsm)
-        │
-        ▼
-[3] compare_subjects → 三平面 + ROI + 直方图 + 差值图
-```
-
-## 🔴 关键单位约定（v2 修正）
-
-| 字段 | 单位 | 来源 | 用途 |
-|---|---|---|---|
-| `phs_tissue` | **ppm** | rad × (1e6 / 2πγB₀TE) | mod_dipole_inversion 最终反演 |
-| `phs_unwrap` | rad | DICOM (Siemens 缩放) | PDF/LBV 背景去除 |
-| `phs_wrap` | rad | mod(unwrap + π, 2π) - π | 解缠测试 |
-| `magn` | a.u. | DICOM (raw 平均) | mask 提取 + MEDI 先验 |
-
-**转换公式**（在 `dicom_loader_subject.m` 中实现）：
 ```matlab
-ppm = rad × 1e6 / (2π × γ × B0 × TE_sec)
-    = rad × 1e6 / (2π × 42.577 × 3 × 0.00973)  % 你的数据
-    = rad × 128.0
+P.projectRoot = 'D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge';
+P.dataRoot    = fullfile(P.projectRoot, 'data_course');
+P.sepiaRoot   = 'D:\MRI_PRO\MRILAB_X\sepia';
 ```
 
-## 预检查流程
+运行时只需要：
 
-v3 新增预检查，**避免运行到一半才发现问题**：
+```matlab
+cd MRI_QSM/MRI_QSM_dicom_adapter
+RUN_WHQSM_ONECLICK
+```
 
-| 检查项 | 失败后果 |
-|---|---|
-| 原库关键模块存在 | 立即报错 |
-| SEPIA 工具箱完整 | 警告（WH-QSM 不可用） |
-| Image Processing Toolbox | 警告（niftiwrite 缺失） |
-| 数据根目录存在 | 立即报错 |
-| NORMAL+ELDERLY 都识别 | 立即报错 |
+或者在项目根目录 `D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge` 运行：
 
-## 复用原库的方法
+```matlab
+RUN_REALDATA_WHQSM_ONECLICK
+```
 
-| ✅ 复用 | ❌ 不自己写 |
-|---|---|
-| `mod_dipole_inversion.m` (TKD/CFL2/iLSQR/MEDI/WH-QSM) | ❌ 不自己实现 dipole inversion |
-| `mod_background_removal.m` (VSHARP/PDF/LBV/WHQSM flag) | ❌ 不自己实现 SMV |
-| `mod_load_data.m` (.mat 兼容) | ❌ 不自己实现数据加载 |
-| `Utils_self/create_dipole_kernel.m` | ❌ 不自己构造偶极子核 |
-| `Utils_self/qsm_diverging_cmap.m` | ❌ 不自己写色图 |
-| `config/pipeline_config.m` (字段约定) | ❌ 不重新定义 cfg 结构 |
-| SEPIA `QSMMacroIOWrapper` + FANSI | ❌ 不自己实现 k-space 反演 |
+如果 MATLAB 已加入 Windows PATH，也可以双击项目根目录下的：
 
-## SEPIA FANSI 参数（由原库 `inversion_whqsm_stable` 自动设置）
+```text
+RUN_WHQSM_ONECLICK.bat
+```
+
+如路径变化，只修改 `whqsm_local_paths.m`，不要修改 Pipeline 主体代码。
+
+## 参数化运行（备用）
+
+```matlab
+cd MRI_QSM/MRI_QSM_dicom_adapter
+setup
+run_whqsm_comparison('D:\path\data_course', 'D:\path\MRI_QSM', ...
+    'sepia_root', 'D:\path\sepia')
+```
+
+调试时保留 SEPIA 中间 NIfTI：
+
+```matlab
+run_whqsm_comparison(..., 'keep_sepia_work', true)
+```
+
+## v4 Pipeline
+
+```text
+run_whqsm_comparison
+  ├─ preflight
+  │   ├─ 检查 dicominfo/dicomread/niftiwrite/niftiread
+  │   ├─ 检查 mod_whqsm_reconstruction.m
+  │   └─ 检查 SEPIA/QSMMacroIOWrapper
+  ├─ discover_subjects
+  │   └─ 找到第一个 NORMAL + 第一个 ELDERLY
+  ├─ NORMAL subject
+  │   ├─ dicom_loader_subject
+  │   │   ├─ Phase/Magnitude/T1 序列识别
+  │   │   ├─ 两回波/多回波 phase(TE) 拟合 → fieldmap_Hz
+  │   │   ├─ fieldmap_Hz → ppm compatibility field
+  │   │   ├─ 自动 mask
+  │   │   └─ 保存 data_full.mat + 单独变量
+  │   └─ mod_whqsm_reconstruction
+  │       └─ SEPIA QSMMacroIOWrapper + FANSI(isWeakHarmonic=true)
+  ├─ ELDERLY subject
+  │   └─ 同上
+  └─ compare_subjects
+      ├─ native-space side-by-side QC
+      ├─ histogram
+      └─ subject_summary.csv
+```
+
+## 当前数据目录结构适配
+
+已针对你的实际目录结构加入强先验：
+
+```text
+8_t1_mprage_sag_p2_iso      -> T1 结构像，不允许作为 WH-QSM magnitude
+14_Mag_Images / 15_Mag_Images -> 原始 SWI magnitude 候选
+16_Pha_Images               -> 原始 SWI phase
+17/18_mIP_Images(SW)        -> 投影后处理图，排除
+19/20_SWI_Images            -> SWI 后处理图，排除
+```
+
+选择逻辑是：先选 `16_Pha_Images` 这类 phase，再从 `14/15_Mag_Images` 中选择与 phase 几何一致的 magnitude；绝不再把 `8_t1_mprage...` 误当作 WH-QSM magnitude。
+
+## 两个/多回波如何处理？
+
+旧版只取最后一个 echo。v4 已改为：
+
+1. 读取每个 echo 的 DICOM `EchoTime`。
+2. 将 Siemens phase internal unit 转成 radians：
+   - 若数据已在 `[-pi, pi]` 附近：直接使用。
+   - 若是常见 Siemens 12-bit 缩放后 `[-4096, 4094]`：使用 `phase_rad = phase_scaled * pi / 4096`。
+3. 沿 echo 维度 `unwrap`。
+4. 对每个 voxel 拟合：
+
+```text
+phase_rad(TE) = intercept + slope * TE
+fieldmap_Hz = slope / (2*pi)
+fieldmap_ppm = fieldmap_Hz / (gamma_MHz_per_T * B0_T)
+```
+
+如果只有一个 echo，则显式 fallback：
+
+```text
+fieldmap_Hz = phase_rad / (2*pi*TE)
+```
+
+所有 echo 参数会写入：
+
+```matlab
+data.echo_times_ms
+data.echo_times_sec
+data.delta_TE
+data.B0
+data.B0_dir
+data.phase_fit_method
+```
+
+这些参数会继续传给 SEPIA header。
+
+## WH-QSM 调用方式
+
+`mod_whqsm_reconstruction.m` 直接调用下层接口：
+
+```matlab
+QSMMacroIOWrapper(input, output_basename, mask_filename, algorParam)
+```
+
+关键参数：
 
 ```matlab
 algorParam.qsm.method = 'FANSI';
-algorParam.qsm.isWeakHarmonic = true;   % ← WH-QSM 标志
+algorParam.qsm.isWeakHarmonic = true;
 algorParam.qsm.constraint = 'TV';
 algorParam.qsm.lambda = 5e-4;
 algorParam.qsm.tol = 1e-4;
@@ -120,126 +151,96 @@ algorParam.qsm.maxiter = 100;
 algorParam.qsm.beta = 150;
 ```
 
-修改：在 `mod_dipole_inversion.m → inversion_whqsm_stable` 中调整。
+传给 SEPIA 的 local field 单位为 **Hz**，不是 ppm：
 
-## 自动识别的被试
+```text
+localField_Hz = data.fieldmap_Hz
+```
 
-`discover_subjects.m` 按以下规则分组：
+SEPIA header 内保存实际 DICOM 参数：
 
-| 文件夹名含 | 分组 |
-|---|---|
-| `normal` / `control` / `young` / `adult` / `hehongjian` | NORMAL |
-| `elderly` / `aged` / `old` / `senior` | ELDERLY |
-| 都不匹配 → 按 SWI 编号排序 | 小号=NORMAL，大号=ELDERLY |
-
-**手动覆盖**：编辑 `discover_subjects.m`，找到对应被试，强制设置：
 ```matlab
-subjects(1).group = 'NORMAL';
-subjects(2).group = 'ELDERLY';
+TE
+delta_TE
+B0 / b0
+B0_dir / b0dir
+CF = B0 * gamma
+matrix_size / voxel_size
+```
+
+## 磁化率分离 / Susceptibility source separation
+
+当前版本已适配你获得的 SNU-LIST Chi-Separation Toolbox：
+
+```matlab
+P.chiSepRoot = 'D:\MRI_PRO\MRILAB_X\20170327_qsm2016_recon_challenge\Chisep_Toolbox_v1.2.1';
+P.chiSepAdapterFunction = 'snu_chisep_v121_adapter';
+```
+
+Pipeline 会从 4 echo magnitude 拟合 `R2star_Hz`，并在 WH-QSM 后调用：
+
+```matlab
+chi_sepnet_general(home_directory, local_field_hz, R2star_Hz, mask, Dr, B0_dir, CF, voxel_size, matrix_size, have_r2map=false)
+```
+
+默认使用 GRE-only `R2*` 路线。SNU 输入 local field 默认采用 `forward_from_whqsm`，即由 WH-QSM 总 χ 正演得到较干净的 tissue field，避免把未显式 BFR 的 DICOM fieldmap 直接送入 χ-sepnet。如需改用原始 DICOM phase fitting field，可在 `whqsm_local_paths.m` 中设置：
+
+```matlab
+P.snuLocalFieldMode = 'measured';
+```
+
+每个被试会输出：
+
+```text
+results/susceptibility_separation/
+├── chisep_inputs.mat
+├── input_chi_total_ppm.nii
+├── input_R2star_Hz.nii
+├── input_localField_Hz.nii
+├── input_mask.nii
+├── snu_chisep_v121_inputs.mat
+├── snu_chisep_v121_raw_outputs.mat
+├── susceptibility_separation_results.mat
+├── chi_para_ppm.nii
+├── chi_dia_ppm.nii
+├── chi_dia_abs_ppm.nii
+└── susceptibility_separation_qc.png
 ```
 
 ## 输出结构
 
-```
+```text
 data_course/
-├── SWI202606/                           ← NORMAL（何洪建）
-├── SWIxxx/                              ← ELDERLY（如果存在）
-└── _qsm_comparison_results/             ← 自动生成
-    ├── normal_SWI202606/
-    │   ├── qsm2016_format/              ← 11 个 .mat (与原库 mod_load_data 兼容)
-    │   │   ├── phs_tissue.mat           ← ppm（关键！）
-    │   │   ├── phs_unwrap.mat           ← rad
-    │   │   ├── msk.mat
+└── _qsm_comparison_results/
+    ├── normal_<subject>/
+    │   ├── qsm2016_format/
+    │   │   ├── data_full.mat
+    │   │   ├── fieldmap_Hz.mat
+    │   │   ├── local_field_ppm.mat
+    │   │   ├── phs_tissue.mat
     │   │   ├── magn.mat
-    │   │   ├── mp_rage.mat
+    │   │   ├── msk.mat
     │   │   ├── spatial_res.mat
-    │   │   └── ...
+    │   │   └── dicom_whqsm_metadata.mat
     │   ├── results/
-    │   │   ├── background_removal_results.mat
-    │   │   ├── dipole_inversion_results.mat  ← 含 WH-QSM
-    │   │   └── pipeline_complete_results.mat
-    │   ├── figures/
+    │   │   ├── whqsm_result.mat
+    │   │   └── WHQSM_chi.nii
     │   ├── chi_normal.mat
-    │   └── all_qsm_normal.mat           ← 所有 5 种方法的结果
-    ├── elderly_SWIXXX/
-    │   └── (同上)
+    │   └── whqsm_normal_complete.mat
+    ├── elderly_<subject>/
+    │   └── 同上
     └── comparison/
-        ├── compare_3view.png            ← 三平面对比
-        ├── compare_roi_basal_ganglia.png
+        ├── qc_normal_native_space.png
+        ├── qc_elderly_native_space.png
+        ├── compare_3view.png
         ├── compare_histogram.png
-        ├── compare_diff_map.png
-        ├── roi_comparison.csv
+        ├── subject_summary.csv
         └── all_results.mat
 ```
 
-## 故障排查
+## 注意
 
-### 问题 1: SEPIA 找不到
-```
-❌ SEPIA 工具箱未找到
-```
-**解决**：确认 SEPIA 安装路径 `D:\MRI_PRO\MRILAB_X\sepia`，或修改 `run_whqsm_comparison.m` 中 `check_sepia_toolbox` 的 candidates。
-
-### 问题 2: ppm 值域异常
-```
-⚠️ ppm 值域异常 [-4096, +4094]
-```
-**原因**：Siemens 缩放公式特殊
-**解决**：
-1. 跑 `SWI202606_dicom_scanner()` 检查 Phase 字段
-2. 在 `dicom_loader_subject.m` 的 `load_phase_volume_rad` 调试
-3. 可能需要 `phase = (pixel - 2048) × π/2048` 转换
-
-### 问题 3: WH-QSM 输出异常
-```
-WH-QSM: 已读取输出文件，但结果数值异常
-```
-**解决**：
-- 加入真正的背景去除：`cfg.bgRemoval.methods = {'VSHARP', 'WHQSM'}`
-- 检查 phase 单位（应该在 ±π rad / ±0.5 ppm 范围）
-
-### 问题 4: 只有一个被试被处理
-**原因**：未同时识别 NORMAL + ELDERLY
-**解决**：手动编辑 `discover_subjects.m` 强制分组
-
-## 与原库的关系
-
-### 完全复用
-- ✅ `mod_dipole_inversion.m` — **核心反演**
-- ✅ `mod_background_removal.m` — 背景去除
-- ✅ `mod_load_data.m` — .mat 兼容
-- ✅ `Utils_self/create_dipole_kernel.m` — 偶极子核
-- ✅ `Utils_self/qsm_diverging_cmap.m` — 色图
-
-### 仅新增
-- 🆕 `discover_subjects.m` — 被试发现
-- 🆕 `dicom_loader_subject.m` — DICOM 适配
-- 🆕 `compare_subjects.m` — 双被试对比
-- 🆕 `setup.m` — 路径配置
-- 🆕 `test_pipeline.m` — 离线测试
-
-## 调优建议
-
-### WH-QSM 调优
-修改 `mod_dipole_inversion.m → inversion_whqsm_stable` 的 `algorParam`：
-
-| 参数 | 当前 | 调小（更锐利） | 调大（更平滑） |
-|---|---|---|---|
-| `lambda` | 5e-4 | 1e-4 | 1e-3 |
-| `maxiter` | 100 | 50 | 200 |
-| `beta` | 150 | 50 | 300 |
-| `tol` | 1e-4 | 1e-3 | 1e-5 |
-
-### 背景场去除
-在 `pipeline_config.m`（或 `build_pipeline_cfg`）中：
-```matlab
-cfg.bgRemoval.methods = {'VSHARP', 'WHQSM'};  % 同时跑 V-SHARP
-```
-
-## 下一步
-
-1. ✅ 确认 SEPIA 已安装且路径正确
-2. ✅ 运行 `setup.m`（首次使用）
-3. ✅ 运行 `test_pipeline.m`（快速验证）
-4. 🚀 运行 `run_whqsm_comparison()`
-5. 📊 查看 `_qsm_comparison_results/comparison/` 下的对比图
+- v4 不做跨被试配准，也不做 voxel-wise subtraction。
+- `compare_subjects` 只输出 native-space QC 与描述性统计，不把差异图作为结论。
+- WH-QSM 必须依赖 SEPIA + FANSI + `QSMMacroIOWrapper`；找不到 SEPIA 时 Pipeline 会 fail fast，不再 silently fallback 到其他算法。
+- 若有多个 NORMAL / ELDERLY，本入口只取各组第一个被试。
