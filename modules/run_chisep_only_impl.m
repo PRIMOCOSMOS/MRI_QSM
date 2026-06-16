@@ -59,11 +59,38 @@ for i = 1:numel(subjectDirs)
     subDir = subjectDirs{i};
     fprintf('\n------------------------------------------------------------\n');
     fprintf('Subject result dir: %s\n', subDir);
-    [data, chi, cfg, label] = load_existing_whqsm_subject(subDir, P);
-    cfg = configure_sep_cfg(cfg, P, subDir);
-    sep_results = mod_susceptibility_separation(data, chi, cfg); %#ok<NASGU>
-    save(fullfile(subDir, ['chisep_only_' label '.mat']), 'sep_results', 'cfg', '-v7.3');
-    fprintf('Saved chi-separation-only result marker: %s\n', fullfile(subDir, ['chisep_only_' label '.mat']));
+    try
+        [data, chi, cfg, label] = load_existing_whqsm_subject(subDir, P);
+    catch ME
+        warning('被试加载失败，跳过: %s\n  原因: %s', subDir, ME.message);
+        if contains(lower(ME.message),'corrupt') || contains(ME.message,'损坏') ...
+                || contains(lower(ME.message),'cannot read')
+            fprintf(['  提示: whqsm_*_complete.mat 可能损坏(常因 WH-QSM 中断或磁盘写入未完成)。\n' ...
+                     '        请对该被试重跑 WH-QSM 生成完整结果文件。\n']);
+        end
+        continue;
+    end
+
+    try
+        cfg = configure_sep_cfg(cfg, P, subDir);
+        runCompare = isfield(P,'chisepRunMethodCompare') && P.chisepRunMethodCompare;
+        if runCompare
+            % Method comparison mode: deep-learning chi-sepnet vs optimization.
+            cmp = mod_chisep_method_comparison(data, chi, cfg); %#ok<NASGU>
+            save(fullfile(subDir, ['chisep_compare_' label '.mat']), 'cmp', 'cfg', '-v7.3');
+            fprintf('Saved chi-separation method-comparison: %s\n', ...
+                fullfile(subDir, ['chisep_compare_' label '.mat']));
+        else
+            % Single-method separation (uses cfg.sep.adapter_function).
+            sep_results = mod_susceptibility_separation(data, chi, cfg); %#ok<NASGU>
+            save(fullfile(subDir, ['chisep_only_' label '.mat']), 'sep_results', 'cfg', '-v7.3');
+            fprintf('Saved chi-separation-only result marker: %s\n', ...
+                fullfile(subDir, ['chisep_only_' label '.mat']));
+        end
+    catch ME
+        warning('被试处理失败，跳过继续: %s\n  原因: %s', subDir, ME.message);
+        continue;
+    end
 end
 
 fprintf('\n✅ CHI-SEPARATION ONLY completed.\n');
@@ -106,10 +133,27 @@ if exist(completeFile, 'file') ~= 2
     end
     completeFile = fullfile(d(1).folder, d(1).name);
 end
-S = load(completeFile);
-if ~isfield(S, 'data') || ~isfield(S, 'chi')
-    error('Complete file lacks data/chi: %s', completeFile);
+% Robust load: if complete.mat is corrupt/truncated, fall back to the
+% companion chi_<grp>.mat (+ qsm2016_format/data_full.mat) to reconstruct.
+S = [];
+loadErr = '';
+try
+    S = load(completeFile);
+catch ME
+    loadErr = ME.message;
+    warning('complete.mat 无法读取(可能损坏): %s\n  尝试从备用文件恢复...', completeFile);
 end
+
+if isempty(S) || ~isfield(S, 'data') || ~isfield(S, 'chi')
+    [S, recMsg] = recover_subject_from_parts(subDir, label);
+    if isempty(S)
+        error(['无法加载被试且恢复失败: %s\n  complete.mat 错误: %s\n  恢复信息: %s\n' ...
+               '  建议: 对该被试重跑 WH-QSM(现已使用原子+校验保存，可避免再次损坏)。'], ...
+               subDir, loadErr, recMsg);
+    end
+    fprintf('  ✅ 已从备用文件恢复该被试 (chi_%s.mat + data_full.mat)。\n', label);
+end
+
 data = S.data;
 chi = S.chi;
 if isfield(S, 'cfg')
@@ -156,4 +200,79 @@ cfg.sep.snu_interp_method = P.snuInterpMethod;
 cfg.sep.snu_sinc_window_size = P.snuSincWindowSize;
 cfg.sep.snu_sinc_window_type = P.snuSincWindowType;
 cfg.sep.snu_Dr = P.snuDr;
+
+% ----- ONNX Runtime chi-separation 桥接配置（绕过 onnxmex） -----
+cfg.sep.onnx_python_executable = get_field_default(P, 'onnxPythonExecutable', '');
+cfg.sep.onnx_bridge_script     = get_field_default(P, 'onnxBridgeScript', '');
+cfg.sep.onnx_qsm_model         = get_field_default(P, 'onnxQsmModel', '');
+cfg.sep.onnx_xsep_model        = get_field_default(P, 'onnxXsepModel', '');
+cfg.sep.onnx_r2prime_model     = get_field_default(P, 'onnxR2primeModel', '');
+cfg.sep.onnx_norm_factor       = get_field_default(P, 'onnxNormFactor', '');
+cfg.sep.onnx_pipeline          = get_field_default(P, 'onnxPipeline', 'auto');
+cfg.sep.onnx_qsm_source        = get_field_default(P, 'onnxQsmSource', 'qsmnet');
+cfg.sep.onnx_field_unit        = get_field_default(P, 'onnxFieldUnit', 'Hz');
+cfg.sep.onnx_device            = get_field_default(P, 'onnxDevice', 'auto');
+cfg.sep.onnx_resgen            = get_field_default(P, 'onnxResgen', 'auto');
+cfg.sep.onnx_r2_map            = get_field_default(P, 'onnxR2Map', []);
+% method-comparison / optimization fields
+cfg.sep.compare_methods        = get_field_default(P, 'chisepCompareMethods', {'onnx','opt'});
+cfg.sep.opt_method             = get_field_default(P, 'optMethod', 'iLSQR');
+cfg.sep.opt_lambda             = get_field_default(P, 'optLambda', 1e-2);
+cfg.sep.opt_w_r2               = get_field_default(P, 'optWr2', 1.0);
+cfg.sep.opt_maxiter            = get_field_default(P, 'optMaxIter', 100);
+cfg.sep.roi_label_file         = get_field_default(P, 'roiLabelFile', '');
+end
+
+function v = get_field_default(S, name, default)
+if isfield(S, name) && ~isempty(S.(name))
+    v = S.(name);
+else
+    v = default;
+end
+end
+
+function [S, msg] = recover_subject_from_parts(subDir, label)
+% Reconstruct a usable {data, chi, cfg} struct from companion files when
+% whqsm_*_complete.mat is corrupt:
+%   - chi_<label>.mat        -> chi (+ sep_results)
+%   - qsm2016_format/data_full.mat -> data (with R2star_Hz etc.)
+S = []; msg = '';
+chiFile = fullfile(subDir, ['chi_' label '.mat']);
+dataFull = fullfile(subDir, 'qsm2016_format', 'data_full.mat');
+
+chi = [];
+try
+    if exist(chiFile,'file') == 2
+        C = load(chiFile);
+        if isfield(C,'chi'), chi = C.chi; end
+    end
+catch ME
+    msg = [msg sprintf('chi_%s.mat 读取失败: %s; ', label, ME.message)];
+end
+
+data = [];
+try
+    if exist(dataFull,'file') == 2
+        D = load(dataFull);
+        if isfield(D,'data'), data = D.data; end
+    end
+catch ME
+    msg = [msg sprintf('data_full.mat 读取失败: %s; ', ME.message)];
+end
+
+if isempty(chi)
+    msg = [msg '未能获得 chi（chi_*.mat 缺失或损坏）; ']; return;
+end
+if isempty(data) || ~isfield(data,'Mask')
+    msg = [msg '未能获得 data/Mask（data_full.mat 缺失或损坏）; ']; return;
+end
+
+% If chi grid mismatches data.Mask, abort (cannot safely proceed).
+if ~isequal(size(chi), size(data.Mask))
+    msg = [msg sprintf('chi 尺寸 %s 与 data.Mask %s 不一致; ', ...
+        mat2str(size(chi)), mat2str(size(data.Mask)))]; return;
+end
+
+S = struct('data', data, 'chi', chi, 'cfg', struct());
+msg = 'recovered from chi_*.mat + data_full.mat';
 end

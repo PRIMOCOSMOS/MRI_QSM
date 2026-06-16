@@ -108,7 +108,13 @@ end
 % Step 5: load phase and fit field map
 % -------------------------------------------------------------------------
 fprintf('\n[5/7] Loading phase and fitting field map...\n');
-[fieldmap_Hz, fieldmap_ppm, phase_meta] = load_phase_fieldmap(phase_series, B0);
+% 传入逐回波 magnitude 做 SNR(magnitude^2) 加权拟合: 降低长 TE 低 SNR 回波
+% (信号衰减到~T2*, 噪声大) 对深部核团场估计的污染。文献标准做法。
+mag4d_for_fit = [];
+if isfield(mag_meta,'mag4d') && ~isempty(mag_meta.mag4d)
+    mag4d_for_fit = mag_meta.mag4d;
+end
+[fieldmap_Hz, fieldmap_ppm, phase_meta] = load_phase_fieldmap(phase_series, B0, mag4d_for_fit);
 fprintf('  Phase array size       : %s\n', mat2str(size(phase_meta.phase_rad_4d)));
 fprintf('  Phase echo times       : %s ms\n', mat2str(phase_meta.echo_times_ms, 6));
 fprintf('  Field fitting method   : %s\n', phase_meta.fit_method);
@@ -531,7 +537,8 @@ meta = struct('echo_times_ms', echo_times_ms, ...
     'n_echoes', size(vol4d,4), ...
     'r2star_Hz', r2star_Hz, ...
     's0', s0, ...
-    'r2_fit_residual', r2_fit_residual);
+    'r2_fit_residual', r2_fit_residual, ...
+    'mag4d', vol4d);   % 逐回波 magnitude, 供相位拟合做 SNR 加权(magnitude^2)
 end
 
 function [r2star_Hz, s0, residual] = compute_r2star_from_magnitude(mag4d, echo_times_ms)
@@ -566,7 +573,8 @@ s0(~isfinite(s0)) = 0;
 residual(~isfinite(residual)) = 0;
 end
 
-function [fieldmap_Hz, fieldmap_ppm, meta] = load_phase_fieldmap(series, B0)
+function [fieldmap_Hz, fieldmap_ppm, meta] = load_phase_fieldmap(series, B0, mag4d)
+if nargin < 3, mag4d = []; end
 [phase_scaled_4d, echo_times_ms, echo_numbers] = build_4d_volume(series.file_paths);
 if isempty(phase_scaled_4d)
     error('Phase volume is empty.');
@@ -592,19 +600,93 @@ nEcho = numel(TE_sec);
 % local implementation.
 phase_unwrapped_4d = unwrap_echo_phase_local(phase_rad_4d);
 
-if nEcho >= 2 && numel(unique(TE_sec)) >= 2
+% ============================================================================
+% 多回波场图估计 (按文献最佳实践排序选择, 优先调用工具箱成熟算法)
+% 依据: Mancini et al. MRM 2022 "Multi-echo QSM: how to combine echoes" —
+%   推荐【非线性复数拟合(NLFit)】在 Laplacian 处理前合并多回波, 深部灰质/静脉
+%   精度最高、噪声传播最低; 优于 SNR加权平均 > 简单平均 > 无权线性拟合。
+%   工具箱实现: MEDI 的 Fit_ppm_complex (Cornell QSM, 文献 NLFit 所用)。
+% 优先级: (1) MEDI Fit_ppm_complex (NLFit) -> (2) magnitude^2 加权线性 -> (3) 无权线性
+% ============================================================================
+fieldmap_Hz = [];
+residual = [];
+fit_method = '';
+
+% ---- (1) 优先: MEDI Fit_ppm_complex 非线性复数拟合 ----
+% 仅在【等回波间隔】时使用(Fit_ppm_complex 假设等间隔, 返回相位/echo)。
+% 结果会做合理性校验(与加权线性拟合量级比对), 不合理则丢弃回退, 确保安全。
+dTE_all = diff(sort(TE_sec));
+equalSpacing = (numel(dTE_all)>=1) && (max(dTE_all)-min(dTE_all) < 0.1*median(dTE_all));
+if nEcho >= 2 && equalSpacing && ~isempty(mag4d) ...
+        && isequal(size(mag4d), size(phase_rad_4d)) ...
+        && exist('Fit_ppm_complex', 'file') == 2
+    try
+        cplx = double(mag4d) .* exp(1i * double(phase_rad_4d));
+        % MEDI 接口: [p1, dp1, relres, p0] = Fit_ppm_complex(M)
+        % p1 = 每回波相位增量(rad/echo)。用 nargout 容错不同版本。
+        try
+            [p1, ~, relres] = Fit_ppm_complex(cplx);
+        catch
+            p1 = Fit_ppm_complex(cplx); relres = [];
+        end
+        dTE = median(dTE_all);
+        if ~(isfinite(dTE) && dTE > 0), dTE = TE_sec(2)-TE_sec(1); end
+        cand_Hz = double(p1) ./ (2*pi*dTE);   % rad/echo -> Hz
+        cand_Hz(~isfinite(cand_Hz)) = 0;
+        % 合理性校验: 脑内 std 应在生理范围 (0.5~20 Hz), 否则视为接口/尺度不符
+        v = cand_Hz(abs(cand_Hz)<200);
+        if ~isempty(v) && std(v(:))>0.3 && std(v(:))<30
+            fieldmap_Hz = cand_Hz;
+            if ~isempty(relres), residual = double(relres); else, residual = zeros(size(cand_Hz)); end
+            fit_method = sprintf('MEDI_Fit_ppm_complex_NLFit_%decho', nEcho);
+            fprintf('  [场图] 使用 MEDI Fit_ppm_complex 非线性复数拟合 (文献推荐).\n');
+        else
+            fprintf('  [场图] Fit_ppm_complex 输出量级异常(std=%.3g), 回退加权线性拟合.\n', std(v(:)));
+            fieldmap_Hz = [];
+        end
+    catch ME_nlfit
+        fprintf('  [场图] Fit_ppm_complex 失败(%s), 回退加权线性拟合.\n', ME_nlfit.message);
+        fieldmap_Hz = [];
+    end
+elseif nEcho >= 2 && ~equalSpacing
+    fprintf('  [场图] 回波非等间隔, 跳过 Fit_ppm_complex, 用加权线性拟合.\n');
+end
+
+if isempty(fieldmap_Hz) && nEcho >= 2 && numel(unique(TE_sec)) >= 2
     t = reshape(TE_sec, [1 1 1 nEcho]);
-    t0 = mean(TE_sec);
-    tc = t - t0;
-    denom = sum((TE_sec - t0).^2);
-    phase_mean = mean(phase_unwrapped_4d, 4);
-    slope_rad_per_sec = sum((phase_unwrapped_4d - phase_mean) .* tc, 4) ./ max(denom, eps);
-    intercept = phase_mean - slope_rad_per_sec .* t0;
-    pred = intercept + slope_rad_per_sec .* t;
-    residual = sqrt(mean((phase_unwrapped_4d - pred).^2, 4));
+    % --- (2)/(3) magnitude^2 加权线性拟合 (NLFit 不可用时的回退) ---
+    % 权重 w = magnitude^2 (近似 SNR^2)。长 TE 低 SNR 回波权重自动变小,
+    % 减少其对深部核团(T2*短)场估计的噪声污染。无 magnitude 时退化为等权。
+    useW = ~isempty(mag4d) && isequal(size(mag4d), size(phase_unwrapped_4d));
+    if useW
+        w = double(mag4d).^2;
+        w(~isfinite(w)) = 0;
+        sw = sum(w, 4); sw(sw<=0) = eps;
+        tw = sum(w .* t, 4) ./ sw;                 % 加权 TE 均值(逐体素)
+        pw = sum(w .* phase_unwrapped_4d, 4) ./ sw; % 加权相位均值
+        num = sum(w .* (phase_unwrapped_4d - pw) .* (t - tw), 4);
+        den = sum(w .* (t - tw).^2, 4); den(den<=0) = eps;
+        slope_rad_per_sec = num ./ den;
+        intercept = pw - slope_rad_per_sec .* tw;
+        pred = intercept + slope_rad_per_sec .* t;
+        residual = sqrt(sum(w.*(phase_unwrapped_4d - pred).^2,4) ./ sw);
+        fit_method = sprintf('multi_echo_MAGWEIGHTED_phase_fit_%decho', nEcho);
+    else
+        t0 = mean(TE_sec);
+        tc = t - t0;
+        denom = sum((TE_sec - t0).^2);
+        phase_mean = mean(phase_unwrapped_4d, 4);
+        slope_rad_per_sec = sum((phase_unwrapped_4d - phase_mean) .* tc, 4) ./ max(denom, eps);
+        intercept = phase_mean - slope_rad_per_sec .* t0;
+        pred = intercept + slope_rad_per_sec .* t;
+        residual = sqrt(mean((phase_unwrapped_4d - pred).^2, 4));
+        fit_method = sprintf('multi_echo_linear_phase_fit_%decho', nEcho);
+    end
     fieldmap_Hz = slope_rad_per_sec ./ (2*pi);
-    fit_method = sprintf('multi_echo_linear_phase_fit_%decho', nEcho);
-else
+end
+
+% 单回波(或多回波拟合都未产出)兜底
+if isempty(fieldmap_Hz)
     fieldmap_Hz = phase_unwrapped_4d(:,:,:,end) ./ (2*pi*TE_sec(end));
     residual = zeros(size(fieldmap_Hz));
     fit_method = 'single_echo_phase_over_TE_fallback';

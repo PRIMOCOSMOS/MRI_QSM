@@ -54,6 +54,19 @@ addParameter(p, 'snu_interp_method', 'sinc', @(x) ischar(x) || isstring(x));
 addParameter(p, 'snu_sinc_window_size', 15, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
 addParameter(p, 'snu_sinc_window_type', 'hann', @(x) ischar(x) || isstring(x));
 addParameter(p, 'snu_Dr', 114, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
+% ----- ONNX Runtime chi-separation bridge (bypass MATLAB onnxmex) -----
+addParameter(p, 'onnx_python_executable', '', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_bridge_script', '', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_qsm_model', '', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_xsep_model', '', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_r2prime_model', '', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_norm_factor', '', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_pipeline', 'auto', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_qsm_source', 'qsmnet', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_field_unit', 'Hz', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_device', 'auto', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_resgen', 'auto', @(x) ischar(x) || isstring(x));
+addParameter(p, 'onnx_r2_map', [], @(x) true);
 addParameter(p, 'whqsm_maxiter', 200, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
 addParameter(p, 'whqsm_tol', 1e-5, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
 addParameter(p, 'whqsm_lambda', 5e-4, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
@@ -82,6 +95,18 @@ snu_interp_method = char(p.Results.snu_interp_method);
 snu_sinc_window_size = p.Results.snu_sinc_window_size;
 snu_sinc_window_type = char(p.Results.snu_sinc_window_type);
 snu_Dr = p.Results.snu_Dr;
+onnx_python_executable = char(p.Results.onnx_python_executable);
+onnx_bridge_script = char(p.Results.onnx_bridge_script);
+onnx_qsm_model = char(p.Results.onnx_qsm_model);
+onnx_xsep_model = char(p.Results.onnx_xsep_model);
+onnx_r2prime_model = char(p.Results.onnx_r2prime_model);
+onnx_norm_factor = char(p.Results.onnx_norm_factor);
+onnx_pipeline = char(p.Results.onnx_pipeline);
+onnx_qsm_source = char(p.Results.onnx_qsm_source);
+onnx_field_unit = char(p.Results.onnx_field_unit);
+onnx_device = char(p.Results.onnx_device);
+onnx_resgen = char(p.Results.onnx_resgen);
+onnx_r2_map = p.Results.onnx_r2_map;
 whqsm_maxiter = p.Results.whqsm_maxiter;
 whqsm_tol = p.Results.whqsm_tol;
 whqsm_lambda = p.Results.whqsm_lambda;
@@ -205,6 +230,19 @@ for li = 1:numel(labels)
         cfg.whqsm.lambda = whqsm_lambda;
         cfg.whqsm.beta = whqsm_beta;
         cfg.whqsm.muh = whqsm_muh;
+        % 对齐 Challenge 已验证的 inversion_whqsm_stable 参数(mu1=5e-5, 即 lambda/10)。
+        % 之前误把 mu1 改成 100*lambda(基于文献), 但 Challenge 用 5e-5 跑得好,
+        % 证明这套参数对本工具链是正确的。撤销错误改动。
+        cfg.whqsm.alpha1 = 5e-4;
+        cfg.whqsm.mu1 = 5e-5;
+        cfg.whqsm.mu  = 5e-5;
+        % 真实 DICOM 数据 = 总场, 必须做背景场去除(BFR)转成局部场再反演。
+        cfg.whqsm.do_bfr = true;
+        cfg.whqsm.bfr_method = 'LBV';   % 文献: 配 WH-QSM 最佳; 回退 V-SHARP
+        cfg.whqsm.bfr_tol = 0.005;
+        cfg.whqsm.bfr_peel = 2;
+        % loader 的 fieldmap_Hz 已是多回波拟合的连续频率场, 不需(也不应)再空间解缠。
+        cfg.whqsm.do_spatial_unwrap = false;
         cfg.sep.enable = run_susceptibility_separation;
         cfg.sep.method = suscep_sep_method;
         cfg.sep.chiSepRoot = chi_sep_root;
@@ -220,6 +258,19 @@ for li = 1:numel(labels)
         cfg.sep.snu_sinc_window_size = snu_sinc_window_size;
         cfg.sep.snu_sinc_window_type = snu_sinc_window_type;
         cfg.sep.snu_Dr = snu_Dr;
+        % ONNX Runtime chi-separation bridge config (bypass onnxmex)
+        cfg.sep.onnx_python_executable = onnx_python_executable;
+        cfg.sep.onnx_bridge_script = onnx_bridge_script;
+        cfg.sep.onnx_qsm_model = onnx_qsm_model;
+        cfg.sep.onnx_xsep_model = onnx_xsep_model;
+        cfg.sep.onnx_r2prime_model = onnx_r2prime_model;
+        cfg.sep.onnx_norm_factor = onnx_norm_factor;
+        cfg.sep.onnx_pipeline = onnx_pipeline;
+        cfg.sep.onnx_qsm_source = onnx_qsm_source;
+        cfg.sep.onnx_field_unit = onnx_field_unit;
+        cfg.sep.onnx_device = onnx_device;
+        cfg.sep.onnx_resgen = onnx_resgen;
+        cfg.sep.onnx_r2_map = onnx_r2_map;
 
         % 2c. Call lower-level SEPIA/FANSI weak-harmonic interface only
         [chi, whqsm_info] = mod_whqsm_reconstruction(data, cfg);
@@ -257,9 +308,13 @@ for li = 1:numel(labels)
             'whqsm_info', whqsm_info, ...
             'susceptibility_separation', sep_results);
 
-        save(fullfile(sub_output, ['chi_' grp '.mat']), 'chi', 'whqsm_info', 'sep_results', '-v7.3');
-        save(fullfile(sub_output, ['whqsm_' grp '_complete.mat']), 'data', 'chi', 'whqsm_info', 'sep_results', 'cfg', '-v7.3');
-        fprintf('  💾 Subject WH-QSM saved: %s\n', sub_output);
+        % Atomic + verified saves so an interrupted write can never leave a
+        % corrupt/truncated .mat (root cause of earlier "文件可能已损坏").
+        save_mat_atomic(fullfile(sub_output, ['chi_' grp '.mat']), ...
+            'chi', 'whqsm_info', 'sep_results', '-v7.3');
+        save_mat_atomic(fullfile(sub_output, ['whqsm_' grp '_complete.mat']), ...
+            'data', 'chi', 'whqsm_info', 'sep_results', 'cfg', '-v7.3');
+        fprintf('  💾 Subject WH-QSM saved (atomic+verified): %s\n', sub_output);
 
     catch ME
         fprintf('\n  ❌ Subject %s failed: %s\n', sub.name, ME.message);
@@ -357,12 +412,18 @@ cfg.whqsm.method = 'FANSI';
 cfg.whqsm.isWeakHarmonic = true;
 cfg.whqsm.reference_tissue = 'None';
 cfg.whqsm.constraint = 'TV';
+% --- FANSI/WH-QSM 正则化参数 (按文献标定, 关键修复) ---
+% 文献铁律: ADMM 的梯度一致性惩罚 mu1 必须远大于 lambda(约 100x; FANSI/SEPIA 默认)。
+%   - SEPIA 默认: mu1 = 100 * lambda
+%   - WH-QSM 原论文(Milovic 2019): mu1 ~ 100 * alpha1
+% 这些默认值对齐 Challenge 已验证的 inversion_whqsm_stable(mod_dipole_inversion.m)。
+% Challenge 数据用 lambda=5e-4, mu1=5e-5 跑出正常结果, 故采用同一套, 不再按文献臆改。
 cfg.whqsm.lambda = 5e-4;
 cfg.whqsm.tol = 1e-4;
 cfg.whqsm.maxiter = 100;
 cfg.whqsm.alpha1 = 5e-4;
 cfg.whqsm.mu1 = 5e-5;
-cfg.whqsm.mu = 5e-5;
+cfg.whqsm.mu  = 5e-5;
 cfg.whqsm.mu2 = 1.0;
 cfg.whqsm.solver = 'Nonlinear';
 cfg.whqsm.gradient_mode = 'none';

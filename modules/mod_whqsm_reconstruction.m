@@ -62,6 +62,32 @@ B0_dir = B0_dir ./ max(norm(B0_dir), eps);
 localField_Hz(~Mask) = 0;
 localField_ppm(~Mask) = 0;
 
+% -------------------------------------------------------------------------
+% 背景场去除(BFR): QSM 共识规定的反演前必需步骤。
+% - 真实 DICOM 数据: data.fieldmap_Hz 是【总场】, 必须 BFR 转成局部场。
+% - Challenge 数据: 已是 phs_tissue(局部场), 不需要也不应再做(默认关闭)。
+% 由 cfg.whqsm.do_bfr 控制(真实数据 pipeline 自动开启)。不改动反演本身。
+% -------------------------------------------------------------------------
+do_bfr = get_cfg_bool(cfg, {'whqsm','do_bfr'}, false);
+if do_bfr
+    if exist('mod_field_preprocess','file') == 2
+        try
+            [localField_Hz, prepInfo] = mod_field_preprocess(data, Mask, cfg);
+            localField_Hz(~Mask) = 0;
+            localField_ppm = localField_Hz ./ (resolve_gyro() * B0);
+            localField_ppm(~Mask) = 0;
+            field_source = sprintf('%s -> BFR(%s)', field_source, prepInfo.bfr_method);
+            info.field_preprocess = prepInfo; %#ok<STRNU>
+        catch ME_bfr
+            error(['背景场去除(BFR)失败: %s' newline ...
+                   '请确认 MEDI/SEPIA 在 path 上(P.mediRoot/P.sepiaRoot)。' newline ...
+                   '若你的输入已是局部场(如 Challenge phs_tissue), 请设 cfg.whqsm.do_bfr=false。'], ME_bfr.message);
+        end
+    else
+        warning('cfg.whqsm.do_bfr=true 但找不到 mod_field_preprocess.m, 跳过 BFR。');
+    end
+end
+
 if ~is_valid_volume(localField_Hz, Mask)
     error('WH-QSM input field map is invalid or nearly all zero. Source=%s', field_source);
 end
@@ -85,6 +111,43 @@ else
 end
 print_stats('Input field Hz', localField_Hz, Mask);
 print_stats('Input field ppm', localField_ppm, Mask);
+
+%% ------------------------------------------------------------------------
+% 优先委托给【Challenge 已验证】的 inversion_whqsm_stable(mod_dipole_inversion.m)。
+% 它输入 ppm 局部场, 内部做 remove_mask_mean + ppm->Hz + Challenge 验证过的
+% FANSI 参数。让真实数据走与 Challenge 完全相同的反演代码, 消除两套 pipeline 差异。
+% (本次反复排查发现: 真实数据 pipeline 的反演与 Challenge 不是同一套, 是问题来源。)
+% -------------------------------------------------------------------------
+useValidated = get_cfg_bool(cfg, {'whqsm','use_validated_inversion'}, true);
+if useValidated && exist('inversion_whqsm_stable','file')==2
+    try
+        data_for_inv = data;
+        data_for_inv.Mask = Mask;
+        if ~isfield(data_for_inv,'magn') || isempty(data_for_inv.magn)
+            data_for_inv.magn = get_magnitude(data, Mask);
+        end
+        fprintf('\nWH-QSM: 委托 Challenge 已验证的 inversion_whqsm_stable (ppm 输入)。\n');
+        chi = inversion_whqsm_stable(localField_ppm, data_for_inv, voxel_size);
+        chi = double(squeeze(chi));
+        if ndims(chi) > 3, chi = chi(:,:,:,1); end
+        if isequal(size(chi), N) && is_valid_volume(chi, Mask)
+            chi(~Mask) = 0;
+            validate_qsm_or_error(chi, Mask);
+            info.inversion_path = 'inversion_whqsm_stable (validated, shared with Challenge)';
+            info.field_source = field_source;
+            info.B0 = B0; info.B0_dir = B0_dir; info.voxel_size = voxel_size;
+            info.matrix_size = N; info.finished_at = datestr(now,31);
+            print_stats('WH-QSM chi ppm', chi, Mask);
+            outMat = fullfile(cfg.resultDir, 'whqsm_result.mat');
+            save(outMat, 'chi', 'info', 'localField_Hz', 'localField_ppm', 'Mask', '-v7.3');
+            return;
+        else
+            warning('inversion_whqsm_stable 输出无效/尺寸不符, 回退到内置 SEPIA 调用。');
+        end
+    catch ME_val
+        warning('委托 inversion_whqsm_stable 失败, 回退内置实现: %s', ME_val.message);
+    end
+end
 
 %% ------------------------------------------------------------------------
 % Add SEPIA path and validate lower-level interface

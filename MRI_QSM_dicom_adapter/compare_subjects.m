@@ -34,7 +34,16 @@ if ~isequal(size(chi_n), size(mask_n)) || ~isequal(size(chi_e), size(mask_e))
     error('QSM and mask sizes do not match for at least one subject.');
 end
 
-qsm_clim = [-0.15 0.15];
+% 显示窗位: 深部铁核 χ 量级约 0.10-0.18ppm，用 ±0.10 比 ±0.15 更能看清对比
+% (窗位越宽图越"淡")。可在 whqsm_local_paths.m 的 P.qsmDisplayClim 调整。
+qsm_clim = [-0.10 0.10];
+try
+    P = whqsm_local_paths();
+    if isfield(P,'qsmDisplayClim') && numel(P.qsmDisplayClim)==2
+        qsm_clim = P.qsmDisplayClim;
+    end
+catch
+end
 field_clim = [-0.20 0.20];
 
 %% 1. Per-subject QC panels

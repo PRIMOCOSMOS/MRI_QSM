@@ -245,9 +245,15 @@ end
 
 fig = figure('Name', ['Susceptibility separation ' label], 'Position', [60 60 1500 850], 'Color', 'w');
 tiledlayout(2,3, 'Padding','compact', 'TileSpacing','compact');
-[~,~,sz] = mask_center_slices(Mask);
-clim_chi = [-0.15 0.15];
-clim_comp = [0 0.20];
+% --- QC 选层：自动定位到基底节层（按 χ_para 深部顺磁热区质心）---
+% 原逻辑用脑mask几何质心 sz=round(mean(z))，会偏腹侧/颅底，切不到苍白球/壳核，
+% 导致 χ-sep 最该展示的深部顺磁对比缺席（"图看着淡/可疑"的真根因）。
+% 改为：在腐蚀后的深部mask里，找 χ_para 强顺磁信号积分最大的轴位层。
+[~,~,sz_center] = mask_center_slices(Mask);
+sz = select_basal_ganglia_slice(chi_para, Mask, sz_center);
+fprintf('QC 选层(基底节自动定位): z=%d (脑质心 z=%d)\n', sz, sz_center);
+clim_chi = [-0.10 0.10];   % 收窄(原 ±0.15)以看清深部铁核对比
+clim_comp = [0 0.15];      % χpara/|χdia| 多在 0-0.15ppm，原 0-0.20 偏宽显淡
 nexttile; show_color(chi_total_ppm(:,:,sz), Mask(:,:,sz), clim_chi); title('WH-QSM total \chi ppm'); colorbar;
 nexttile; show_color(R2star_Hz(:,:,sz), Mask(:,:,sz), [0 prctile(R2star_Hz(Mask),95)]); title('R2* Hz'); colorbar;
 nexttile; show_color(chi_para(:,:,sz), Mask(:,:,sz), clim_comp); title('\chi_{para} ppm'); colorbar;
@@ -303,6 +309,97 @@ end
 [x,y,z] = ind2sub(size(mask), idx);
 sx=round(mean(x)); sy=round(mean(y)); sz=round(mean(z));
 N=size(mask); sx=max(1,min(N(1),sx)); sy=max(1,min(N(2),sy)); sz=max(1,min(N(3),sz));
+end
+
+function sz = select_basal_ganglia_slice(chi_para, mask, sz_fallback)
+% 自动选取"基底节层"用于 QC 显示：找腐蚀后的深部脑mask里 χ_para 强顺磁信号
+% 积分最大的轴位层（苍白球/壳核是脑内最强顺磁源）。带稳健回退。
+%
+% 思路（不靠固定中间层，不靠肉眼）：
+%   1) 腐蚀脑mask，剔除皮层/边缘/静脉壁等浅层强信号，只保留深部组织。
+%   2) 对每个轴位层 z，阈值取深部mask内 χ_para 的高分位(p85)，把强顺磁体素的
+%      (值-阈值) 之和作为该层"深部铁核含量"得分。
+%   3) 限定在脑中部 [0.30, 0.75]*Nz 的轴位范围内搜索（基底节解剖先验，
+%      避免选到颅底强信号或顶部）。
+%   4) 取得分最大的层；若 χ_para 全空/异常则回退到几何质心 sz_fallback。
+sz = sz_fallback;
+try
+    N = size(mask);
+    if numel(N) < 3, return; end
+    Nz = N(3);
+
+    % --- 1) 腐蚀mask到深部（核大小按面内体素，至少3）---
+    er = max(3, round(min(N(1:2)) * 0.04));
+    deep = erode_mask_3d(mask, er);
+    if nnz(deep) < 50, deep = mask; end   % 腐蚀过头则不腐蚀
+
+    cp = double(chi_para);
+    cp(~isfinite(cp)) = 0;
+
+    % --- 2)+3) 按轴位层在解剖先验范围内打分 ---
+    z0 = max(1, round(0.30 * Nz));
+    z1 = min(Nz, round(0.75 * Nz));
+    scores = -inf(Nz,1);
+    for z = z0:z1
+        m = deep(:,:,z);
+        if nnz(m) < 20, continue; end
+        s = cp(:,:,z);
+        vals = s(m);
+        vals = vals(isfinite(vals));
+        if isempty(vals), continue; end
+        thr = prctile(vals, 85);          % 该层深部 χ_para 高分位阈
+        if ~isfinite(thr) || thr <= 0, thr = 0; end
+        pos = vals(vals > thr) - thr;     % 强顺磁体素超出阈值的部分
+        scores(z) = sum(pos);             % 积分 = 深部铁核含量
+    end
+
+    [best, zbest] = max(scores);
+    if isfinite(best) && best > 0
+        sz = zbest;
+    end
+    sz = max(1, min(Nz, round(sz)));
+catch ME
+    warning('select_basal_ganglia_slice 失败, 回退几何质心: %s', ME.message);
+    sz = sz_fallback;
+end
+end
+
+function out = erode_mask_3d(mask, r)
+% 简单的3D方形腐蚀（不依赖 image toolbox 的 imerode/strel）。
+% 用 r 半径的 box 腐蚀：逐维 min-filter（位移取交集）。
+mask = logical(mask);
+out = mask;
+N = size(mask);
+for d = 1:3
+    acc = out;
+    for s = 1:r
+        % 正负方向各位移 s，取与原mask的交集（腐蚀=任一邻域为0则该点为0）
+        shp = shift_logical(out, d, s);
+        shm = shift_logical(out, d, -s);
+        acc = acc & shp & shm;
+    end
+    out = acc;
+end
+out = out & mask;
+end
+
+function y = shift_logical(x, dim, s)
+% 沿 dim 位移 s 个体素，越界处补 false（保证边缘被腐蚀掉）。
+y = false(size(x));
+N = size(x);
+idx = repmat({':'}, 1, ndims(x));
+idy = idx;
+if s >= 0
+    src = 1:(N(dim)-s);
+    dst = (1+s):N(dim);
+else
+    s = -s;
+    src = (1+s):N(dim);
+    dst = 1:(N(dim)-s);
+end
+if isempty(src), return; end
+idx{dim} = dst; idy{dim} = src;
+y(idx{:}) = x(idy{:});
 end
 
 function show_color(img, mask, clim)

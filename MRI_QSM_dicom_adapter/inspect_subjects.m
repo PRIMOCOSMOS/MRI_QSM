@@ -130,6 +130,10 @@ for k = 1:length(subject_roots)
     fprintf('  StudyDate     : %s\n', sdate);
     fprintf('  StudyDesc     : %s\n', sdesc);
 
+    % ====== 采集参数(场强/回波/序列) — 直接回答"真的是3T吗" ======
+    fprintf('  ---- 采集参数(扫描所有序列, 用于核实场强/回波) ----\n');
+    report_acquisition_params(subj_dcm);
+
     % 算年龄
     age_years = NaN;
     age_source = '';
@@ -225,6 +229,80 @@ out_dir = fullfile(data_root, '_scan_report');
 if ~exist(out_dir, 'dir'), mkdir(out_dir); end
 save(fullfile(out_dir, 'subjects_info.mat'), 'subjects_info');
 fprintf('\n💾 保存到: %s\n', fullfile(out_dir, 'subjects_info.mat'));
+end
+
+function report_acquisition_params(dcm_paths)
+% 扫描该被试所有 DICOM, 按序列(SeriesDescription)汇总关键采集参数:
+%   场强(MagneticFieldStrength)、ImagingFrequency(反推场强)、TE、TR、
+%   翻转角、像素间距、序列名。用于核实"真的是3T吗"以及回波协议。
+nmax = min(numel(dcm_paths), 400);   % 抽样上限, 避免太慢
+field_set = containers.Map('KeyType','char','ValueType','any');  % seriesDesc -> struct
+for i = 1:nmax
+    try, info = dicominfo(dcm_paths{i}); catch, continue; end
+    sd = get_field_str(info, 'SeriesDescription', '?');
+    B0 = get_field_num(info, 'MagneticFieldStrength', NaN);
+    f0 = get_field_num(info, 'ImagingFrequency', NaN);     % MHz
+    TE = get_field_num(info, 'EchoTime', NaN);             % ms
+    TR = get_field_num(info, 'RepetitionTime', NaN);       % ms
+    EN = get_field_num(info, 'EchoNumbers', NaN);
+    FA = get_field_num(info, 'FlipAngle', NaN);
+    mf = get_field_str(info, 'Manufacturer', '?');
+    if ~isKey(field_set, sd)
+        s = struct('B0',[],'f0',[],'TE',[],'TR',[],'FA',[],'EN',[],'manu',mf,'n',0);
+        field_set(sd) = s;
+    end
+    s = field_set(sd);
+    s.B0(end+1)=B0; s.f0(end+1)=f0; s.TE(end+1)=TE; s.TR(end+1)=TR;
+    s.FA(end+1)=FA; s.EN(end+1)=EN; s.n=s.n+1;
+    field_set(sd) = s;
+end
+ks = keys(field_set);
+for i = 1:numel(ks)
+    s = field_set(ks{i});
+    B0u = unique(s.B0(~isnan(s.B0)));
+    f0u = unique(round(s.f0(~isnan(s.f0)),2));
+    TEu = unique(round(s.TE(~isnan(s.TE)),3));
+    TRu = unique(round(s.TR(~isnan(s.TR)),1));
+    FAu = unique(s.FA(~isnan(s.FA)));
+    % 场强: 优先 MagneticFieldStrength, 否则用 ImagingFrequency/42.577 反推
+    if ~isempty(B0u)
+        b0str = sprintf('%.3g T (MagneticFieldStrength)', B0u(1));
+    elseif ~isempty(f0u)
+        b0str = sprintf('%.3g T (由 ImagingFrequency=%.2fMHz 反推)', f0u(1)/42.577, f0u(1));
+    else
+        b0str = '未知(DICOM无场强字段!)';
+    end
+    fprintf('    序列 "%s" [%s, %d 文件]:\n', ks{i}, s.manu, s.n);
+    fprintf('      场强 = %s\n', b0str);
+    fprintf('      TE(ms) = %s  (回波数=%d)\n', mat2str(TEu), numel(TEu));
+    fprintf('      TR(ms) = %s , FlipAngle = %s\n', mat2str(TRu), mat2str(FAu));
+end
+end
+
+function v = get_field_num(info, fname, default)
+v = default;
+try
+    if isfield(info, fname) && ~isempty(info.(fname))
+        x = info.(fname);
+        if ischar(x), x = str2double(x); end
+        if isnumeric(x) && ~isempty(x) && isfinite(x(1)), v = double(x(1)); end
+    end
+catch
+end
+end
+
+function v = get_field_str(info, fname, default)
+v = default;
+try
+    if isfield(info, fname) && ~isempty(info.(fname))
+        x = info.(fname);
+        if ischar(x), v = x;
+        elseif isstring(x), v = char(x);
+        elseif isstruct(x) && isfield(x,'FamilyName'), v = char(x.FamilyName);
+        end
+    end
+catch
+end
 end
 
 function v = safe_str(s, fname, default)
