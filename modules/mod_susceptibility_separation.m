@@ -232,8 +232,14 @@ chi_dia = sep.chi_dia;
 chi_dia_abs = abs(chi_dia);
 chi_recombined = chi_para + chi_dia;
 
+qsm_used_ppm = chi_total_ppm;
+if isfield(sep,'extra') && isstruct(sep.extra) && isfield(sep.extra,'qsm_map') && ...
+        isequal(size(sep.extra.qsm_map), size(Mask))
+    qsm_used_ppm = double(sep.extra.qsm_map);
+    qsm_used_ppm(~Mask) = 0;
+end
 save(fullfile(outDir, 'susceptibility_separation_results.mat'), ...
-    'sep', 'chi_total_ppm', 'R2star_Hz', 'chi_para', 'chi_dia', 'chi_dia_abs', 'chi_recombined', 'Mask', '-v7.3');
+    'sep', 'chi_total_ppm', 'qsm_used_ppm', 'R2star_Hz', 'chi_para', 'chi_dia', 'chi_dia_abs', 'chi_recombined', 'Mask', '-v7.3');
 try
     niftiwrite(single(chi_para), fullfile(outDir, 'chi_para_ppm.nii'));
     niftiwrite(single(chi_dia), fullfile(outDir, 'chi_dia_ppm.nii'));
@@ -243,27 +249,51 @@ catch ME
     warning('Could not save susceptibility separation NIfTI outputs: %s', ME.message);
 end
 
+% Show the QSM map actually used by the separation model. For official SNU
+% chi-sep this is qsm_map returned by the toolbox/adapter, which may differ
+% from the external WH-QSM total χ (e.g. qsmnet source). This avoids mixing
+% model-used QSM with an unrelated reference map in the QC panel.
+qsm_used_ppm = chi_total_ppm;
+qsm_used_title = 'WH-QSM total \chi ppm';
+if isfield(sep,'extra') && isstruct(sep.extra) && isfield(sep.extra,'qsm_map') && ...
+        isequal(size(sep.extra.qsm_map), size(Mask))
+    qsm_used_ppm = double(sep.extra.qsm_map);
+    qsm_used_ppm(~Mask) = 0;
+    qsm_used_title = 'QSM used by \chi-sep';
+end
+
 fig = figure('Name', ['Susceptibility separation ' label], 'Position', [60 60 1500 850], 'Color', 'w');
 tiledlayout(2,3, 'Padding','compact', 'TileSpacing','compact');
-% --- QC 选层：自动定位到基底节层（按 χ_para 深部顺磁热区质心）---
-% 原逻辑用脑mask几何质心 sz=round(mean(z))，会偏腹侧/颅底，切不到苍白球/壳核，
-% 导致 χ-sep 最该展示的深部顺磁对比缺席（"图看着淡/可疑"的真根因）。
-% 改为：在腐蚀后的深部mask里，找 χ_para 强顺磁信号积分最大的轴位层。
-[~,~,sz_center] = mask_center_slices(Mask);
-sz = select_basal_ganglia_slice(chi_para, Mask, sz_center);
-fprintf('QC 选层(基底节自动定位): z=%d (脑质心 z=%d)\n', sz, sz_center);
-clim_chi = [-0.10 0.10];   % 收窄(原 ±0.15)以看清深部铁核对比
-clim_comp = [0 0.15];      % χpara/|χdia| 多在 0-0.15ppm，原 0-0.20 偏宽显淡
-nexttile; show_color(chi_total_ppm(:,:,sz), Mask(:,:,sz), clim_chi); title('WH-QSM total \chi ppm'); colorbar;
-nexttile; show_color(R2star_Hz(:,:,sz), Mask(:,:,sz), [0 prctile(R2star_Hz(Mask),95)]); title('R2* Hz'); colorbar;
-nexttile; show_color(chi_para(:,:,sz), Mask(:,:,sz), clim_comp); title('\chi_{para} ppm'); colorbar;
-nexttile; show_color(chi_dia_abs(:,:,sz), Mask(:,:,sz), clim_comp); title('|\chi_{dia}| ppm'); colorbar;
-nexttile; show_color(chi_recombined(:,:,sz), Mask(:,:,sz), clim_chi); title('\chi_{para}+\chi_{dia} ppm'); colorbar;
+% --- QC 取面：按病人坐标找真正的 axial 维，再在该维度上自动找基底节层。---
+% 旧逻辑默认 dim3 是轴位层，且只靠 χpara 打分，容易被边缘伪影带偏到"不完整脑"。
+% 现逻辑：
+%   1) 从 DICOM IOP 解析 axial 对应的数组维度；
+%   2) 仅在该维度的脑中部候选层搜索；
+%   3) 约束切层面积必须接近最大脑面积，避免选到边缘半脑层；
+%   4) 用 χpara + R2* 的深部高值联合打分，更稳定地落在苍白球/壳核层。
+axialDim = get_display_dim(data, 'axial', 3);
+axialCenter = center_index_along_dim(Mask, axialDim);
+sz = select_basal_ganglia_slice_dim(chi_para, R2star_Hz, Mask, axialDim, axialCenter);
+acqPlane = 'UNKNOWN';
+if isstruct(data) && isfield(data,'acquisition_plane') && ~isempty(data.acquisition_plane)
+    acqPlane = char(data.acquisition_plane);
+end
+fprintf('QC 选层(病人轴位): dim=%d, idx=%d (中心 idx=%d, acquisition=%s)\n', ...
+    axialDim, sz, axialCenter, acqPlane);
+clim_chi = [-0.10 0.10];
+clim_comp = [0 0.15];
+[img, msk] = extract_dim_slice(qsm_used_ppm, Mask, axialDim, sz); nexttile; show_color(img, msk, clim_chi); title(qsm_used_title); colorbar;
+[img, msk] = extract_dim_slice(R2star_Hz, Mask, axialDim, sz); nexttile; show_color(img, msk, [0 prctile(R2star_Hz(Mask),95)]); title('R2* Hz'); colorbar;
+[img, msk] = extract_dim_slice(chi_para, Mask, axialDim, sz); nexttile; show_color(img, msk, clim_comp); title('\chi_{para} ppm'); colorbar;
+[img, msk] = extract_dim_slice(chi_dia_abs, Mask, axialDim, sz); nexttile; show_color(img, msk, clim_comp); title('|\chi_{dia}| ppm'); colorbar;
+[img, msk] = extract_dim_slice(chi_recombined, Mask, axialDim, sz); nexttile; show_color(img, msk, clim_chi); title('\chi_{para}+\chi_{dia} ppm'); colorbar;
 nexttile; axis off;
-text(0, .9, sprintf('Method: %s', sep.method), 'Interpreter','none', 'FontWeight','bold');
-text(0, .75, sprintf('Status: %s', sep.status), 'Interpreter','none');
-text(0, .60, sprintf('Subject: %s', data.subject_name), 'Interpreter','none');
-if isfield(sep, 'warning'), text(0, .42, sep.warning, 'Interpreter','none'); end
+text(0, .92, sprintf('Method: %s', sep.method), 'Interpreter','none', 'FontWeight','bold');
+text(0, .78, sprintf('Status: %s', sep.status), 'Interpreter','none');
+text(0, .64, sprintf('Subject: %s', data.subject_name), 'Interpreter','none');
+text(0, .50, sprintf('QC axial dim/index: %d / %d', axialDim, sz), 'Interpreter','none');
+text(0, .38, sprintf('QSM source shown: %s', qsm_used_title), 'Interpreter','none');
+if isfield(sep, 'warning'), text(0, .20, sep.warning, 'Interpreter','none'); end
 sgtitle(['Susceptibility source separation QC (' label ')'], 'Interpreter','none');
 try
     exportgraphics(fig, fullfile(outDir, 'susceptibility_separation_qc.png'), 'Resolution', 200);
@@ -301,66 +331,94 @@ if isempty(v), fprintf('%s: empty\n', name); return; end
 fprintf('%s: median=%.6g, p01=%.6g, p99=%.6g, std=%.6g\n', name, median(v), prctile(v,1), prctile(v,99), std(v));
 end
 
-function [sx, sy, sz] = mask_center_slices(mask)
+function dim = get_display_dim(data, planeName, fallback)
+name = lower(char(planeName));
+switch name
+    case 'axial', fld = 'display_dim_axial';
+    case 'coronal', fld = 'display_dim_coronal';
+    case 'sagittal', fld = 'display_dim_sagittal';
+    otherwise, fld = '';
+end
+if ~isempty(fld) && isstruct(data) && isfield(data, fld) && ~isempty(data.(fld))
+    dim = double(data.(fld));
+else
+    dim = fallback;
+end
+if ~(isscalar(dim) && isfinite(dim) && dim>=1 && dim<=3)
+    dim = fallback;
+end
+end
+
+function idx0 = center_index_along_dim(mask, dim)
 idx = find(mask);
 if isempty(idx)
-    N = size(mask); sx=round(N(1)/2); sy=round(N(2)/2); sz=round(N(3)/2); return;
+    N = size(mask); idx0 = round(N(dim)/2); return;
 end
-[x,y,z] = ind2sub(size(mask), idx);
-sx=round(mean(x)); sy=round(mean(y)); sz=round(mean(z));
-N=size(mask); sx=max(1,min(N(1),sx)); sy=max(1,min(N(2),sy)); sz=max(1,min(N(3),sz));
+[sub{1:3}] = ind2sub(size(mask), idx); %#ok<AGROW>
+v = sub{dim};
+idx0 = round(mean(v));
+N = size(mask); idx0 = max(1, min(N(dim), idx0));
 end
 
-function sz = select_basal_ganglia_slice(chi_para, mask, sz_fallback)
-% 自动选取"基底节层"用于 QC 显示：找腐蚀后的深部脑mask里 χ_para 强顺磁信号
-% 积分最大的轴位层（苍白球/壳核是脑内最强顺磁源）。带稳健回退。
-%
-% 思路（不靠固定中间层，不靠肉眼）：
-%   1) 腐蚀脑mask，剔除皮层/边缘/静脉壁等浅层强信号，只保留深部组织。
-%   2) 对每个轴位层 z，阈值取深部mask内 χ_para 的高分位(p85)，把强顺磁体素的
-%      (值-阈值) 之和作为该层"深部铁核含量"得分。
-%   3) 限定在脑中部 [0.30, 0.75]*Nz 的轴位范围内搜索（基底节解剖先验，
-%      避免选到颅底强信号或顶部）。
-%   4) 取得分最大的层；若 χ_para 全空/异常则回退到几何质心 sz_fallback。
-sz = sz_fallback;
+function idx_best = select_basal_ganglia_slice_dim(chi_para, R2star_Hz, mask, dim, idx_fallback)
+% Orientation-aware BG slice picker. Searches along the requested display
+% dimension only, gates by near-max brain area to avoid partial-brain slices,
+% then scores deep-tissue χpara and R2* jointly.
+idx_best = idx_fallback;
 try
     N = size(mask);
-    if numel(N) < 3, return; end
-    Nz = N(3);
-
-    % --- 1) 腐蚀mask到深部（核大小按面内体素，至少3）---
-    er = max(3, round(min(N(1:2)) * 0.04));
+    nSlice = N(dim);
+    er = max(3, round(min(N(setdiff(1:3, dim))) * 0.04));
     deep = erode_mask_3d(mask, er);
-    if nnz(deep) < 50, deep = mask; end   % 腐蚀过头则不腐蚀
-
-    cp = double(chi_para);
-    cp(~isfinite(cp)) = 0;
-
-    % --- 2)+3) 按轴位层在解剖先验范围内打分 ---
-    z0 = max(1, round(0.30 * Nz));
-    z1 = min(Nz, round(0.75 * Nz));
-    scores = -inf(Nz,1);
-    for z = z0:z1
-        m = deep(:,:,z);
+    if nnz(deep) < 50, deep = mask; end
+    cp = double(chi_para); cp(~isfinite(cp)) = 0;
+    r2 = double(R2star_Hz); r2(~isfinite(r2)) = 0;
+    area = zeros(nSlice,1);
+    scores = -inf(nSlice,1);
+    for k = 1:nSlice
+        [m,~] = extract_dim_slice(deep, deep, dim, k);
+        area(k) = nnz(m);
+    end
+    maxArea = max(area);
+    k0 = max(1, round(0.30*nSlice));
+    k1 = min(nSlice, round(0.75*nSlice));
+    for k = k0:k1
+        if area(k) < 0.80 * maxArea, continue; end  % avoid edge/half-brain slices
+        [m,~] = extract_dim_slice(deep, deep, dim, k);
         if nnz(m) < 20, continue; end
-        s = cp(:,:,z);
-        vals = s(m);
-        vals = vals(isfinite(vals));
+        [s,~] = extract_dim_slice(cp, deep, dim, k);
+        vals = s(m>0); vals = vals(isfinite(vals));
         if isempty(vals), continue; end
-        thr = prctile(vals, 85);          % 该层深部 χ_para 高分位阈
-        if ~isfinite(thr) || thr <= 0, thr = 0; end
-        pos = vals(vals > thr) - thr;     % 强顺磁体素超出阈值的部分
-        scores(z) = sum(pos);             % 积分 = 深部铁核含量
+        thr = prctile(vals, 85); if ~isfinite(thr) || thr < 0, thr = 0; end
+        pos = vals(vals > thr) - thr;
+        % Add a modest R2* consistency term so basal-ganglia slices win over
+        % pure edge-artefact slices when χpara alone is ambiguous.
+        [r2s,~] = extract_dim_slice(r2, deep, dim, k);
+        r2v = r2s(m>0); r2v = r2v(isfinite(r2v));
+        if isempty(r2v), r2score = 0; else, r2score = sum(max(r2v - prctile(r2v,85), 0)); end
+        scores(k) = sum(pos) + 0.10 * r2score;
     end
-
-    [best, zbest] = max(scores);
-    if isfinite(best) && best > 0
-        sz = zbest;
-    end
-    sz = max(1, min(Nz, round(sz)));
+    [best, kbest] = max(scores);
+    if isfinite(best) && best > 0, idx_best = kbest; end
+    idx_best = max(1, min(nSlice, round(idx_best)));
 catch ME
-    warning('select_basal_ganglia_slice 失败, 回退几何质心: %s', ME.message);
-    sz = sz_fallback;
+    warning('select_basal_ganglia_slice_dim 失败, 回退中心层: %s', ME.message);
+    idx_best = idx_fallback;
+end
+end
+
+function [img, msk] = extract_dim_slice(vol, mask, dim, idx)
+idx = round(idx);
+switch dim
+    case 1
+        img = squeeze(vol(idx,:,:));
+        msk = squeeze(mask(idx,:,:));
+    case 2
+        img = squeeze(vol(:,idx,:));
+        msk = squeeze(mask(:,idx,:));
+    otherwise
+        img = squeeze(vol(:,:,idx));
+        msk = squeeze(mask(:,:,idx));
 end
 end
 

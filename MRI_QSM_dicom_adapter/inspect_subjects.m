@@ -247,13 +247,15 @@ for i = 1:nmax
     EN = get_field_num(info, 'EchoNumbers', NaN);
     FA = get_field_num(info, 'FlipAngle', NaN);
     mf = get_field_str(info, 'Manufacturer', '?');
+    IOP = get_field_vec(info, 'ImageOrientationPatient', 6);
     if ~isKey(field_set, sd)
-        s = struct('B0',[],'f0',[],'TE',[],'TR',[],'FA',[],'EN',[],'manu',mf,'n',0);
+        s = struct('B0',[],'f0',[],'TE',[],'TR',[],'FA',[],'EN',[],'IOP',IOP,'manu',mf,'n',0);
         field_set(sd) = s;
     end
     s = field_set(sd);
     s.B0(end+1)=B0; s.f0(end+1)=f0; s.TE(end+1)=TE; s.TR(end+1)=TR;
     s.FA(end+1)=FA; s.EN(end+1)=EN; s.n=s.n+1;
+    if isempty(s.IOP) && ~isempty(IOP), s.IOP = IOP; end
     field_set(sd) = s;
 end
 ks = keys(field_set);
@@ -272,10 +274,24 @@ for i = 1:numel(ks)
     else
         b0str = '未知(DICOM无场强字段!)';
     end
+    % 方向/取面
+    planeStr = 'UNKNOWN';
+    if isfield(s,'IOP') && numel(s.IOP) >= 6 && all(isfinite(s.IOP(1:6)))
+        row = s.IOP(1:3); col = s.IOP(4:6);
+        row = row ./ max(norm(row), eps); col = col ./ max(norm(col), eps);
+        nrm = cross(row, col); nrm = nrm ./ max(norm(nrm), eps);
+        [~, idp] = max(abs(nrm));
+        switch idp
+            case 1, planeStr = 'SAGITTAL';
+            case 2, planeStr = 'CORONAL';
+            case 3, planeStr = 'AXIAL';
+        end
+    end
     fprintf('    序列 "%s" [%s, %d 文件]:\n', ks{i}, s.manu, s.n);
     fprintf('      场强 = %s\n', b0str);
     fprintf('      TE(ms) = %s  (回波数=%d)\n', mat2str(TEu), numel(TEu));
     fprintf('      TR(ms) = %s , FlipAngle = %s\n', mat2str(TRu), mat2str(FAu));
+    fprintf('      取面 = %s\n', planeStr);
 end
 end
 
@@ -286,6 +302,20 @@ try
         x = info.(fname);
         if ischar(x), x = str2double(x); end
         if isnumeric(x) && ~isempty(x) && isfinite(x(1)), v = double(x(1)); end
+    end
+catch
+end
+end
+
+function v = get_field_vec(info, fname, n)
+v = [];
+try
+    if isfield(info, fname) && ~isempty(info.(fname))
+        x = double(info.(fname));
+        x = x(:).';
+        if numel(x) >= n && all(isfinite(x(1:n)))
+            v = x(1:n);
+        end
     end
 catch
 end

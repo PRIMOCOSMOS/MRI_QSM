@@ -39,6 +39,21 @@ addParameter(p, 'mask_erode_mm', 1.5, @(x) isnumeric(x) && isscalar(x) && isfini
 addParameter(p, 'mask_threshold_factor', 0.12, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x < 1);
 addParameter(p, 'bet_fractional_threshold', 0.50, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x < 1);
 addParameter(p, 'bet_vertical_gradient', 0.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
+addParameter(p, 'use_phase_quality_mask', true, @islogical);
+addParameter(p, 'phase_residual_percentile', 97.5, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 50 && x < 100);
+addParameter(p, 'phase_residual_mad_factor', 4.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'phase_residual_max_rad', 0.35, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'phase_relative_residual_max', 0.50, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'phase_quality_min_keep_fraction', 0.85, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x <= 1);
+addParameter(p, 'use_r2star_edge_refine', true, @islogical);
+addParameter(p, 'r2star_edge_band_mm', 2.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x >= 0);
+addParameter(p, 'r2star_edge_percentile', 97.5, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 50 && x < 100);
+addParameter(p, 'r2star_edge_abs_max_hz', 80, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'post_bfr_erode_mm', 1.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x >= 0);
+addParameter(p, 'use_two_pass_qsm', true, @islogical);
+addParameter(p, 'two_pass_mask_use_last_echo', true, @islogical);
+addParameter(p, 'two_pass_mask_otsu_factor', 1.3, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'two_pass_mask_shell_mm', 3.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x >= 0);
 addParameter(p, 'run_susceptibility_separation', true, @islogical);
 addParameter(p, 'chi_sep_root', '', @(x) ischar(x) || isstring(x));
 addParameter(p, 'chi_sep_adapter_function', '', @(x) ischar(x) || isstring(x));
@@ -80,6 +95,21 @@ mask_erode_mm = p.Results.mask_erode_mm;
 mask_threshold_factor = p.Results.mask_threshold_factor;
 bet_fractional_threshold = p.Results.bet_fractional_threshold;
 bet_vertical_gradient = p.Results.bet_vertical_gradient;
+use_phase_quality_mask = p.Results.use_phase_quality_mask;
+phase_residual_percentile = p.Results.phase_residual_percentile;
+phase_residual_mad_factor = p.Results.phase_residual_mad_factor;
+phase_residual_max_rad = p.Results.phase_residual_max_rad;
+phase_relative_residual_max = p.Results.phase_relative_residual_max;
+phase_quality_min_keep_fraction = p.Results.phase_quality_min_keep_fraction;
+use_r2star_edge_refine = p.Results.use_r2star_edge_refine;
+r2star_edge_band_mm = p.Results.r2star_edge_band_mm;
+r2star_edge_percentile = p.Results.r2star_edge_percentile;
+r2star_edge_abs_max_hz = p.Results.r2star_edge_abs_max_hz;
+post_bfr_erode_mm = p.Results.post_bfr_erode_mm;
+use_two_pass_qsm = p.Results.use_two_pass_qsm;
+two_pass_mask_use_last_echo = p.Results.two_pass_mask_use_last_echo;
+two_pass_mask_otsu_factor = p.Results.two_pass_mask_otsu_factor;
+two_pass_mask_shell_mm = p.Results.two_pass_mask_shell_mm;
 run_susceptibility_separation = p.Results.run_susceptibility_separation;
 chi_sep_root = char(p.Results.chi_sep_root);
 chi_sep_adapter_function = char(p.Results.chi_sep_adapter_function);
@@ -221,7 +251,17 @@ for li = 1:numel(labels)
             'mask_erode_mm', mask_erode_mm, ...
             'mask_threshold_factor', mask_threshold_factor, ...
             'bet_fractional_threshold', bet_fractional_threshold, ...
-            'bet_vertical_gradient', bet_vertical_gradient);
+            'bet_vertical_gradient', bet_vertical_gradient, ...
+            'use_phase_quality_mask', use_phase_quality_mask, ...
+            'phase_residual_percentile', phase_residual_percentile, ...
+            'phase_residual_mad_factor', phase_residual_mad_factor, ...
+            'phase_residual_max_rad', phase_residual_max_rad, ...
+            'phase_relative_residual_max', phase_relative_residual_max, ...
+            'phase_quality_min_keep_fraction', phase_quality_min_keep_fraction, ...
+            'use_two_pass_qsm', use_two_pass_qsm, ...
+            'two_pass_mask_use_last_echo', two_pass_mask_use_last_echo, ...
+            'two_pass_mask_otsu_factor', two_pass_mask_otsu_factor, ...
+            'two_pass_mask_shell_mm', two_pass_mask_shell_mm);
 
         % 2b. Build minimal WH-QSM config
         cfg = build_whqsm_cfg(sub_output, mri_qsm_root, sepiaRoot, keep_sepia_work);
@@ -243,6 +283,13 @@ for li = 1:numel(labels)
         cfg.whqsm.bfr_peel = 2;
         % loader 的 fieldmap_Hz 已是多回波拟合的连续频率场, 不需(也不应)再空间解缠。
         cfg.whqsm.do_spatial_unwrap = false;
+        % real-data only boundary suppression controls
+        cfg.whqsm.use_r2star_edge_refine = use_r2star_edge_refine;
+        cfg.whqsm.r2star_edge_band_mm = r2star_edge_band_mm;
+        cfg.whqsm.r2star_edge_percentile = r2star_edge_percentile;
+        cfg.whqsm.r2star_edge_abs_max_hz = r2star_edge_abs_max_hz;
+        cfg.whqsm.post_bfr_erode_mm = post_bfr_erode_mm;
+        cfg.whqsm.use_two_pass_qsm = use_two_pass_qsm;
         cfg.sep.enable = run_susceptibility_separation;
         cfg.sep.method = suscep_sep_method;
         cfg.sep.chiSepRoot = chi_sep_root;
@@ -274,6 +321,10 @@ for li = 1:numel(labels)
 
         % 2c. Call lower-level SEPIA/FANSI weak-harmonic interface only
         [chi, whqsm_info] = mod_whqsm_reconstruction(data, cfg);
+        if isfield(whqsm_info, 'final_mask') && isequal(size(whqsm_info.final_mask), size(data.Mask))
+            data.Mask = logical(whqsm_info.final_mask);
+            data.msk = data.Mask;
+        end
         chi(~data.Mask) = 0;
 
         % 2d. Susceptibility source separation add-on (toolbox first)
@@ -303,6 +354,12 @@ for li = 1:numel(labels)
             'delta_TE_sec', data.delta_TE, ...
             'B0', data.B0, ...
             'B0_dir', data.B0_dir, ...
+            'B0_dir_patient', getfield_if_present(data,'B0_dir_patient', [0 0 1]), ...
+            'image_axis_patient', getfield_if_present(data,'image_axis_patient', eye(3)), ...
+            'acquisition_plane', getfield_if_present(data,'acquisition_plane', 'UNKNOWN'), ...
+            'display_dim_axial', getfield_if_present(data,'display_dim_axial', 3), ...
+            'display_dim_coronal', getfield_if_present(data,'display_dim_coronal', 2), ...
+            'display_dim_sagittal', getfield_if_present(data,'display_dim_sagittal', 1), ...
             'phase_fit_method', data.phase_fit_method, ...
             'qsm_method', 'WH-QSM_SEPIA_FANSI', ...
             'whqsm_info', whqsm_info, ...
@@ -436,4 +493,13 @@ cfg.whqsm.keep_work_dir = keep_sepia_work;
 % being called in this real-data pipeline.
 cfg.deeplearning.enable = false;
 cfg.run_only = 'WH-QSM';
+end
+
+%% =========================================================================
+function v = getfield_if_present(s, name, default)
+if isstruct(s) && isfield(s, name) && ~isempty(s.(name))
+    v = s.(name);
+else
+    v = default;
+end
 end

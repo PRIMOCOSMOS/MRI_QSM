@@ -32,7 +32,12 @@ function [localField_Hz, prep] = mod_field_preprocess(data, Mask, cfg)
 % ============================================================================
 
 prep = struct();
-Mask = logical(Mask);
+Mask = logical(Mask);              % inversion/reporting mask (may contain holes)
+if isfield(data,'Mask_BFR') && ~isempty(data.Mask_BFR) && isequal(size(data.Mask_BFR), size(Mask))
+    MaskBFR = logical(data.Mask_BFR);
+else
+    MaskBFR = Mask;
+end
 N = size(Mask);
 voxel_size = double(data.spatial_res(:).');
 B0 = double(data.B0);
@@ -47,6 +52,12 @@ tol       = double(get_cfg(cfg, {'whqsm','bfr_tol'}, 0.005));
 peel      = double(get_cfg(cfg, {'whqsm','bfr_peel'}, 2));
 vsharpR   = get_cfg(cfg, {'whqsm','bfr_vsharp_radius'}, 1:1:12);
 doUnwrap  = get_cfg(cfg, {'whqsm','do_spatial_unwrap'}, 'auto');
+useR2edge = logical(get_cfg(cfg, {'whqsm','use_r2star_edge_refine'}, true));
+r2BandMm  = double(get_cfg(cfg, {'whqsm','r2star_edge_band_mm'}, 2.0));
+r2Pct     = double(get_cfg(cfg, {'whqsm','r2star_edge_percentile'}, 97.5));
+r2AbsMax  = double(get_cfg(cfg, {'whqsm','r2star_edge_abs_max_hz'}, 80));
+postBfrErodeMm = double(get_cfg(cfg, {'whqsm','post_bfr_erode_mm'}, 1.0));
+useTwoPass = logical(get_cfg(cfg, {'whqsm','use_two_pass_qsm'}, false));
 
 % -------------------------------------------------------------------------
 % 0) 取总场(Hz)
@@ -59,10 +70,10 @@ else
     error('mod_field_preprocess: 找不到总场(fieldmap_Hz / local_field_ppm)。');
 end
 totalField_Hz(~isfinite(totalField_Hz)) = 0;
-totalField_Hz(~Mask) = 0;
+totalField_Hz(~MaskBFR) = 0;
 
 fprintf('\n========== 场图制备 (BFR, 反演前必需步骤) ==========\n');
-print_field_stats('总场 total field (Hz)', totalField_Hz, Mask);
+print_field_stats('总场 total field (Hz)', totalField_Hz, MaskBFR);
 
 % -------------------------------------------------------------------------
 % 1) 空间相位解缠 (可选, 默认关闭)
@@ -74,11 +85,11 @@ print_field_stats('总场 total field (Hz)', totalField_Hz, Mask);
 prep.spatial_unwrap = 'skipped';
 needUnwrap = decide_unwrap(doUnwrap);   % 默认 false
 if needUnwrap
-    [unwrappedField_Hz, uw_method] = spatial_unwrap_field(data, totalField_Hz, Mask, voxel_size);
-    if ~isempty(unwrappedField_Hz) && field_not_destroyed(totalField_Hz, unwrappedField_Hz, Mask)
-        totalField_Hz = unwrappedField_Hz; totalField_Hz(~Mask)=0;
+    [unwrappedField_Hz, uw_method] = spatial_unwrap_field(data, totalField_Hz, MaskBFR, voxel_size);
+    if ~isempty(unwrappedField_Hz) && field_not_destroyed(totalField_Hz, unwrappedField_Hz, MaskBFR)
+        totalField_Hz = unwrappedField_Hz; totalField_Hz(~MaskBFR)=0;
         prep.spatial_unwrap = uw_method;
-        print_field_stats('空间解缠后总场 (Hz)', totalField_Hz, Mask);
+        print_field_stats('空间解缠后总场 (Hz)', totalField_Hz, MaskBFR);
     else
         warning('空间解缠被跳过(不可用或会破坏场)。直接用拟合频率场。');
     end
@@ -89,7 +100,7 @@ end
 %    收集每个方法的真实错误并打印, 不再静默吞掉。
 % -------------------------------------------------------------------------
 order = bfr_order(bfrMethod);
-localField_Hz = []; usedBFR = ''; bfrMask = Mask;
+localField_Hz = []; usedBFR = ''; bfrMask = MaskBFR;
 errLog = {};
 for i = 1:numel(order)
     m = order{i};
@@ -101,7 +112,7 @@ for i = 1:numel(order)
                     errLog{end+1} = 'LBV: 找不到 bg_removal_lbv_medi (MEDI/SEPIA 未加 path?)'; %#ok<AGROW>
                     continue;
                 end
-                [lf, nm] = bg_removal_lbv_medi(totalField_Hz, Mask, N, voxel_size, tol, peel);
+                [lf, nm] = bg_removal_lbv_medi(totalField_Hz, MaskBFR, N, voxel_size, tol, peel);
                 [ok,why] = check_field(lf, nm); 
                 if ok, localField_Hz=lf; bfrMask=logical(nm); usedBFR='LBV'; break;
                 else, errLog{end+1} = ['LBV 输出无效: ' why]; end %#ok<AGROW>
@@ -109,15 +120,15 @@ for i = 1:numel(order)
                 if exist('bg_removal_pdf_medi','file')~=2
                     errLog{end+1} = 'PDF: 找不到 bg_removal_pdf_medi'; continue; %#ok<AGROW>
                 end
-                lf = bg_removal_pdf_medi(totalField_Hz, Mask, N, voxel_size, B0_dir);
-                [ok,why] = check_field(lf, Mask);
+                lf = bg_removal_pdf_medi(totalField_Hz, MaskBFR, N, voxel_size, B0_dir);
+                [ok,why] = check_field(lf, MaskBFR);
                 if ok, localField_Hz=lf; usedBFR='PDF'; break;
                 else, errLog{end+1} = ['PDF 输出无效: ' why]; end %#ok<AGROW>
             case 'VSHARP'
                 if exist('bg_removal_vsharp','file')~=2
                     errLog{end+1} = 'VSHARP: 找不到 bg_removal_vsharp'; continue; %#ok<AGROW>
                 end
-                [lf, nm] = bg_removal_vsharp(totalField_Hz, Mask, voxel_size, vsharpR);
+                [lf, nm] = bg_removal_vsharp(totalField_Hz, MaskBFR, voxel_size, vsharpR);
                 [ok,why] = check_field(lf, nm);
                 if ok, localField_Hz=lf; bfrMask=logical(nm); usedBFR='VSHARP'; break;
                 else, errLog{end+1} = ['VSHARP 输出无效: ' why]; end %#ok<AGROW>
@@ -143,11 +154,61 @@ end
 localField_Hz(~bfrMask) = 0;
 localField_Hz(~isfinite(localField_Hz)) = 0;
 
-print_field_stats(sprintf('局部场 local field (Hz) [%s]', usedBFR), localField_Hz, bfrMask);
+% -------------------------------------------------------------------------
+% 2b) Build final mask for dipole inversion / reporting
+%     - start from BFR-valid region
+%     - reintroduce holes from the reliable-phase mask (consensus recommendation)
+%     - optional R2* edge refinement (SEPIA-inspired, only on a thin boundary band)
+%     - optional final post-BFR erosion to suppress residual boundary fields
+% -------------------------------------------------------------------------
+if isfield(data,'mask_reliable_raw') && ~isempty(data.mask_reliable_raw) && isequal(size(data.mask_reliable_raw), size(bfrMask))
+    reliableRaw = logical(data.mask_reliable_raw);
+else
+    reliableRaw = Mask;
+end
+
+% Broad/fill mask: used by pass-2 to recover strong/less-reliable sources
+% and, in the single-pass default, also used as the final QSM mask to avoid
+% spurious holes. This follows the user request to keep the reliable-phase
+% pruning moderate and hole-free in final outputs.
+maskFilled = largest_component_safe(bfrMask);
+
+r2info = struct('used', false, 'threshold_hz', NaN, 'removed_voxels', 0, 'band_voxels', 0);
+if useR2edge && isfield(data,'R2star_Hz') && ~isempty(data.R2star_Hz)
+    [maskFilled, r2info] = refine_mask_by_r2star_edge(maskFilled, double(data.R2star_Hz), voxel_size, r2BandMm, r2Pct, r2AbsMax);
+end
+
+% Strict/hole mask: only used when two-pass is explicitly enabled. Build it
+% from the reliable-phase holes, but keep final single-pass mask hole-free.
+maskStrict = maskFilled & reliableRaw;
+maskStrict = largest_component_safe(maskStrict);
+if postBfrErodeMm > 0
+    maskFilled = erode_mask_mm_safe(maskFilled, voxel_size, postBfrErodeMm);
+    maskFilled = largest_component_safe(maskFilled);
+    if useTwoPass
+        maskStrict = erode_mask_mm_safe(maskStrict, voxel_size, postBfrErodeMm);
+        maskStrict = largest_component_safe(maskStrict);
+    end
+end
+
+localField_Hz(~maskFilled) = 0;
+
+print_field_stats(sprintf('局部场 local field (Hz) broad [%s]', usedBFR), localField_Hz, maskFilled);
+if useTwoPass
+    print_field_stats(sprintf('局部场 local field (Hz) strict [%s]', usedBFR), localField_Hz, maskStrict);
+    fprintf('  Two-pass masks: strict=%d voxels, filled=%d voxels\n', nnz(maskStrict), nnz(maskFilled));
+else
+    fprintf('  Final single-pass mask (hole-free): %d voxels\n', nnz(maskFilled));
+end
 
 prep.bfr_method = usedBFR;
 prep.bfr_tol = tol; prep.bfr_peel = peel;
+prep.mask_input_bfr = MaskBFR;
 prep.mask_after_bfr = bfrMask;
+prep.mask_for_qsm = maskFilled;
+prep.mask_two_pass_strict = maskStrict;
+prep.mask_two_pass_filled = maskFilled;
+prep.r2star_edge_refine = r2info;
 prep.totalField_Hz = totalField_Hz;
 
 % -------------------------------------------------------------------------
@@ -239,6 +300,65 @@ function showf(img,mask,cl)
 img=rot90(squeeze(img)); mask=rot90(squeeze(mask));
 h=imagesc(img,cl); set(h,'AlphaData',double(mask)); axis image off; set(gca,'Color','k');
 colormap(gca, gray(256));
+end
+
+function [maskOut, info] = refine_mask_by_r2star_edge(maskIn, R2star_Hz, voxel_size, band_mm, pct, abs_max_hz)
+maskOut = logical(maskIn);
+info = struct('used', false, 'threshold_hz', NaN, 'removed_voxels', 0, 'band_voxels', 0);
+if band_mm <= 0, return; end
+inner = erode_mask_mm_safe(maskOut, voxel_size, band_mm);
+band = maskOut & ~inner;
+vals = double(R2star_Hz(band));
+vals = vals(isfinite(vals) & vals > 0);
+info.band_voxels = nnz(band);
+if isempty(vals), return; end
+thr = min(prctile(vals, pct), abs_max_hz);
+if ~(isfinite(thr) && thr > 0), return; end
+remove = band & isfinite(R2star_Hz) & (double(R2star_Hz) > thr);
+maskOut(remove) = false;
+maskOut = largest_component_safe(maskOut);
+info.used = true;
+info.threshold_hz = thr;
+info.removed_voxels = nnz(remove);
+end
+
+function out = erode_mask_mm_safe(mask, spatial_res, erode_mm)
+out = logical(mask);
+if erode_mm <= 0, return; end
+try
+    out = erode_mask_mm(mask, spatial_res, erode_mm);
+catch
+end
+end
+
+function out = largest_component_safe(mask)
+out = logical(mask);
+try
+    out = largest_component(out);
+catch
+end
+end
+
+function out = erode_mask_mm(mask, spatial_res, erode_mm)
+spatial_res = double(spatial_res(:).');
+rx = max(1, ceil(erode_mm / spatial_res(1)));
+ry = max(1, ceil(erode_mm / spatial_res(2)));
+rz = max(1, ceil(erode_mm / spatial_res(3)));
+[x, y, z] = ndgrid(-rx:rx, -ry:ry, -rz:rz);
+se = (x*spatial_res(1)).^2 + (y*spatial_res(2)).^2 + (z*spatial_res(3)).^2 <= erode_mm^2;
+out = imerode(logical(mask), se);
+end
+
+function mask = largest_component(mask)
+mask = logical(mask);
+CC = bwconncomp(mask, 6);
+if CC.NumObjects > 1
+    sizes = cellfun(@numel, CC.PixelIdxList);
+    [~, idx_max] = max(sizes);
+    tmp = false(size(mask));
+    tmp(CC.PixelIdxList{idx_max}) = true;
+    mask = tmp;
+end
 end
 
 function print_field_stats(name, vol, Mask)

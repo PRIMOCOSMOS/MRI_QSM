@@ -32,7 +32,14 @@ fprintf('评估参考: %s\n', ref_name);
 fprintf('算法数量: %d\n', nAlg);
 
 %% 加载评估 mask (区分 WM/GM)
-eval_mask = double(data.evaluation_mask);
+if isfield(data,'evaluation_mask') && ~isempty(data.evaluation_mask)
+    eval_mask = double(data.evaluation_mask);
+elseif isfield(data,'Mask') && ~isempty(data.Mask)
+    % 基准/真实数据若没有官方分区标签, 回退到全脑 mask 作为 ROI。
+    eval_mask = double(data.Mask);
+else
+    error('mod_evaluation: 缺少 evaluation_mask / Mask');
+end
 wm_mask = eval_mask > 6;
 gm_mask = eval_mask > 0 & eval_mask <= 6;
 roi_mask = eval_mask > 0;

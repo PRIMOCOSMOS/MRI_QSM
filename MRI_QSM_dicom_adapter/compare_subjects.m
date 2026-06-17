@@ -146,20 +146,29 @@ mag = double(mag);
 field_ppm = double(field_ppm);
 
 [sx, sy, sz] = mask_center_slices(mask);
+axDim = get_display_dim_from_result(result, 'axial', 3);
+coDim = get_display_dim_from_result(result, 'coronal', 2);
+saDim = get_display_dim_from_result(result, 'sagittal', 1);
+axIdx = center_index_along_dim(mask, axDim);
+coIdx = center_index_along_dim(mask, coDim);
+saIdx = center_index_along_dim(mask, saDim);
 
 fig = figure('Name', ['WH-QSM QC ' label], 'Position', [60 60 1650 850], 'Color', 'w');
 tiledlayout(2,4, 'Padding', 'compact', 'TileSpacing', 'compact');
 
-% Row 1: axial QC at mask centre
-nexttile; show_gray_slice(mag(:,:,sz), mask(:,:,sz)); title(sprintf('%s magnitude axial z=%d', label, sz), 'Interpreter','none');
-nexttile; show_mask_slice(mask(:,:,sz)); title('Brain mask axial', 'Interpreter','none');
-nexttile; show_color_slice(field_ppm(:,:,sz), mask(:,:,sz), field_clim, redblue_cmap_local(256)); title('Input field ppm axial', 'Interpreter','none'); colorbar;
-nexttile; show_color_slice(chi(:,:,sz), mask(:,:,sz), qsm_clim, redblue_cmap_local(256)); title('WH-QSM ppm axial', 'Interpreter','none'); colorbar;
+% Row 1: patient-axial QC at orientation-aware centre
+[axMag, axMask] = extract_dim_slice_local(mag, mask, axDim, axIdx);
+[axField, ~] = extract_dim_slice_local(field_ppm, mask, axDim, axIdx);
+[axChi, ~] = extract_dim_slice_local(chi, mask, axDim, axIdx);
+nexttile; show_gray_slice(axMag, axMask); title(sprintf('%s magnitude axial dim%d=%d', label, axDim, axIdx), 'Interpreter','none');
+nexttile; show_mask_slice(axMask); title('Brain mask axial', 'Interpreter','none');
+nexttile; show_color_slice(axField, axMask, field_clim, redblue_cmap_local(256)); title('Input field ppm axial', 'Interpreter','none'); colorbar;
+nexttile; show_color_slice(axChi, axMask, qsm_clim, redblue_cmap_local(256)); title('WH-QSM ppm axial', 'Interpreter','none'); colorbar;
 
-% Row 2: WH-QSM three planes
-nexttile; show_color_slice(chi(:,:,sz), mask(:,:,sz), qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM axial z=%d', sz), 'Interpreter','none');
-nexttile; show_color_slice(squeeze(chi(:,sy,:)), squeeze(mask(:,sy,:)), qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM coronal y=%d', sy), 'Interpreter','none');
-nexttile; show_color_slice(squeeze(chi(sx,:,:)), squeeze(mask(sx,:,:)), qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM sagittal x=%d', sx), 'Interpreter','none');
+% Row 2: patient-axial/coronal/sagittal three planes
+[img, msk] = extract_dim_slice_local(chi, mask, axDim, axIdx); nexttile; show_color_slice(img, msk, qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM axial dim%d=%d', axDim, axIdx), 'Interpreter','none');
+[img, msk] = extract_dim_slice_local(chi, mask, coDim, coIdx); nexttile; show_color_slice(img, msk, qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM coronal dim%d=%d', coDim, coIdx), 'Interpreter','none');
+[img, msk] = extract_dim_slice_local(chi, mask, saDim, saIdx); nexttile; show_color_slice(img, msk, qsm_clim, redblue_cmap_local(256)); title(sprintf('QSM sagittal dim%d=%d', saDim, saIdx), 'Interpreter','none');
 nexttile; axis off;
 st = summary_stats(chi(mask));
 text(0, 0.95, sprintf('%s: %s', label, result.name), 'FontWeight','bold', 'Interpreter','none');
@@ -176,23 +185,32 @@ end
 
 %% =========================================================================
 function plot_subject_3planes(chi, mask, result, start_subplot, clim, label)
-[slice_x, slice_y, slice_z] = mask_center_slices(mask);
+axDim = get_display_dim_from_result(result, 'axial', 3);
+coDim = get_display_dim_from_result(result, 'coronal', 2);
+saDim = get_display_dim_from_result(result, 'sagittal', 1);
+axIdx = center_index_along_dim(mask, axDim);
+coIdx = center_index_along_dim(mask, coDim);
+saIdx = center_index_along_dim(mask, saDim);
 
-subtitle = sprintf('%s: %s | TE=%s ms | B0=%.3gT', ...
-    label, result.name, mat2str(getfield_or(result, 'echo_times_ms', []), 5), getfield_or(result, 'B0', NaN));
+subtitle = sprintf('%s: %s | TE=%s ms | B0=%.3gT | Acq=%s', ...
+    label, result.name, mat2str(getfield_or(result, 'echo_times_ms', []), 5), getfield_or(result, 'B0', NaN), ...
+    getfield_or(result, 'acquisition_plane', 'UNKNOWN'));
 
 subplot(2,3,start_subplot);
-show_color_slice(chi(:,:,slice_z), mask(:,:,slice_z), clim, redblue_cmap_local(256));
-title(sprintf('%s axial z=%d', label, slice_z), 'Interpreter', 'none');
+[img, msk] = extract_dim_slice_local(chi, mask, axDim, axIdx);
+show_color_slice(img, msk, clim, redblue_cmap_local(256));
+title(sprintf('%s axial dim%d=%d', label, axDim, axIdx), 'Interpreter', 'none');
 ylabel(subtitle, 'Interpreter', 'none', 'FontSize', 9);
 
 subplot(2,3,start_subplot+1);
-show_color_slice(squeeze(chi(:,slice_y,:)), squeeze(mask(:,slice_y,:)), clim, redblue_cmap_local(256));
-title(sprintf('%s coronal y=%d', label, slice_y), 'Interpreter', 'none');
+[img, msk] = extract_dim_slice_local(chi, mask, coDim, coIdx);
+show_color_slice(img, msk, clim, redblue_cmap_local(256));
+title(sprintf('%s coronal dim%d=%d', label, coDim, coIdx), 'Interpreter', 'none');
 
 subplot(2,3,start_subplot+2);
-show_color_slice(squeeze(chi(slice_x,:,:)), squeeze(mask(slice_x,:,:)), clim, redblue_cmap_local(256));
-title(sprintf('%s sagittal x=%d', label, slice_x), 'Interpreter', 'none');
+[img, msk] = extract_dim_slice_local(chi, mask, saDim, saIdx);
+show_color_slice(img, msk, clim, redblue_cmap_local(256));
+title(sprintf('%s sagittal dim%d=%d', label, saDim, saIdx), 'Interpreter', 'none');
 end
 
 function [sx, sy, sz] = mask_center_slices(mask)
@@ -316,4 +334,38 @@ a = linspace(0, 1, n1)';
 b = linspace(0, 1, n2)';
 cmap = [blue + (white-blue).*a; white + (red-white).*b];
 cmap = max(min(cmap, 1), 0);
+end
+
+function dim = get_display_dim_from_result(result, planeName, fallback)
+fld = ['display_dim_' lower(char(planeName))];
+dim = getfield_or(result, fld, fallback);
+if ~(isscalar(dim) && isfinite(dim) && dim>=1 && dim<=3)
+    dim = fallback;
+end
+end
+
+function idx0 = center_index_along_dim(mask, dim)
+idx = find(mask);
+if isempty(idx)
+    N = size(mask); idx0 = round(N(dim)/2); return;
+end
+[sub{1:3}] = ind2sub(size(mask), idx); %#ok<AGROW>
+v = sub{dim};
+idx0 = round(mean(v));
+N = size(mask); idx0 = max(1, min(N(dim), idx0));
+end
+
+function [img, msk] = extract_dim_slice_local(vol, mask, dim, idx)
+idx = round(idx);
+switch dim
+    case 1
+        img = squeeze(vol(idx,:,:));
+        msk = squeeze(mask(idx,:,:));
+    case 2
+        img = squeeze(vol(:,idx,:));
+        msk = squeeze(mask(:,idx,:));
+    otherwise
+        img = squeeze(vol(:,:,idx));
+        msk = squeeze(mask(:,:,idx));
+end
 end

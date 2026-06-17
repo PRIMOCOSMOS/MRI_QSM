@@ -30,12 +30,32 @@ addParameter(p, 'mask_erode_mm', 1.5, @(x) isnumeric(x) && isscalar(x) && isfini
 addParameter(p, 'mask_threshold_factor', 0.12, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x < 1);
 addParameter(p, 'bet_fractional_threshold', 0.50, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x < 1);
 addParameter(p, 'bet_vertical_gradient', 0.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x));
+addParameter(p, 'use_phase_quality_mask', true, @islogical);
+addParameter(p, 'phase_residual_percentile', 97.5, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 50 && x < 100);
+addParameter(p, 'phase_residual_mad_factor', 4.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'phase_residual_max_rad', 0.35, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'phase_relative_residual_max', 0.50, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'phase_quality_min_keep_fraction', 0.85, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0 && x <= 1);
+addParameter(p, 'use_two_pass_qsm', true, @islogical);
+addParameter(p, 'two_pass_mask_use_last_echo', true, @islogical);
+addParameter(p, 'two_pass_mask_otsu_factor', 1.3, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x > 0);
+addParameter(p, 'two_pass_mask_shell_mm', 3.0, @(x) isnumeric(x) && isscalar(x) && isfinite(x) && x >= 0);
 parse(p, varargin{:});
 mask_method = char(p.Results.mask_method);
 mask_erode_mm = p.Results.mask_erode_mm;
 mask_threshold_factor = p.Results.mask_threshold_factor;
 bet_fractional_threshold = p.Results.bet_fractional_threshold;
 bet_vertical_gradient = p.Results.bet_vertical_gradient;
+use_phase_quality_mask = p.Results.use_phase_quality_mask;
+phase_residual_percentile = p.Results.phase_residual_percentile;
+phase_residual_mad_factor = p.Results.phase_residual_mad_factor;
+phase_residual_max_rad = p.Results.phase_residual_max_rad;
+phase_relative_residual_max = p.Results.phase_relative_residual_max;
+phase_quality_min_keep_fraction = p.Results.phase_quality_min_keep_fraction;
+use_two_pass_qsm = p.Results.use_two_pass_qsm;
+two_pass_mask_use_last_echo = p.Results.two_pass_mask_use_last_echo;
+two_pass_mask_otsu_factor = p.Results.two_pass_mask_otsu_factor;
+two_pass_mask_shell_mm = p.Results.two_pass_mask_shell_mm;
 
 if ~exist(output_data_dir, 'dir')
     mkdir(output_data_dir);
@@ -46,6 +66,10 @@ fprintf('============================================================\n');
 fprintf(' DICOM loader v4 - subject: %s (%s)\n', subject.name, upper(subject.group));
 fprintf(' Path: %s\n', subject.path);
 fprintf(' Mask method: %s, erosion: %.3g mm, threshold factor: %.3g\n', mask_method, mask_erode_mm, mask_threshold_factor);
+fprintf(' Phase-quality mask: %d, residual pct=%.1f, MADx=%.2f, abs max=%.3g rad, rel max=%.3g, min keep=%.2f\n', ...
+    use_phase_quality_mask, phase_residual_percentile, phase_residual_mad_factor, phase_residual_max_rad, phase_relative_residual_max, phase_quality_min_keep_fraction);
+fprintf(' Two-pass mask seed: useTwoPass=%d, useLastEcho=%d, otsuFactor=%.2f, shell=%.2f mm\n', ...
+    use_two_pass_qsm, two_pass_mask_use_last_echo, two_pass_mask_otsu_factor, two_pass_mask_shell_mm);
 fprintf('============================================================\n\n');
 
 %% ------------------------------------------------------------------------
@@ -81,7 +105,8 @@ if isempty(mag_series)
 end
 
 B0 = detect_B0(phase_series.info, mag_series.info, get_info_or_empty(t1_series));
-B0_dir = detect_B0_dir(phase_series.info);
+orient = detect_orientation_info(phase_series.info);
+B0_dir = detect_B0_dir(phase_series.info, orient);
 fprintf('  Phase     : Ser#%s, %d files, %s\n', safe_series_no(phase_series.info), numel(phase_series.file_paths), get_desc(phase_series.info));
 fprintf('  Magnitude : Ser#%s, %d files, %s\n', safe_series_no(mag_series.info), numel(mag_series.file_paths), get_desc(mag_series.info));
 if ~isempty(t1_series)
@@ -90,7 +115,17 @@ else
     fprintf('  T1        : not found (WH-QSM does not require it)\n');
 end
 fprintf('  B0        : %.4g T\n', B0);
-fprintf('  B0 dir    : [%.4g %.4g %.4g]\n', B0_dir(1), B0_dir(2), B0_dir(3));
+fprintf('  B0 dir(img): [%.4g %.4g %.4g]\n', B0_dir(1), B0_dir(2), B0_dir(3));
+if orient.valid
+    fprintf('  Orientation: %s acquisition | axial/coronal/sagittal dims = [%d %d %d]\n', ...
+        orient.acquisition_plane, orient.display_dim_axial, orient.display_dim_coronal, orient.display_dim_sagittal);
+    fprintf('  Axis(patient LPS) dim1/dim2/dim3 = [% .3f % .3f % .3f] / [% .3f % .3f % .3f] / [% .3f % .3f % .3f]\n', ...
+        orient.image_axis_patient(1,1), orient.image_axis_patient(2,1), orient.image_axis_patient(3,1), ...
+        orient.image_axis_patient(1,2), orient.image_axis_patient(2,2), orient.image_axis_patient(3,2), ...
+        orient.image_axis_patient(1,3), orient.image_axis_patient(2,3), orient.image_axis_patient(3,3));
+else
+    fprintf('  Orientation: unavailable from DICOM ImageOrientationPatient; fallback display/kernel assumptions apply.\n');
+end
 
 %% ------------------------------------------------------------------------
 % Step 4: load magnitude
@@ -161,16 +196,53 @@ if any(~isfinite(spatial_res)) || any(spatial_res <= 0)
 end
 fprintf('  Voxel size: [%.6g %.6g %.6g] mm\n', spatial_res(1), spatial_res(2), spatial_res(3));
 
-mask = generate_brain_mask(magn_vol, spatial_res, mask_erode_mm, mask_threshold_factor, ...
+% QSM consensus recommends combining the brain-extraction mask with a
+% phase-quality mask before background field removal. We therefore:
+%   (1) build an initial intracranial mask from magnitude only (no final peel),
+%   (2) derive a reliable-phase mask from multi-echo fit residual,
+%   (3) combine/fill/keep largest component, and only then
+%   (4) apply the final physical edge peel used for QSM inversion.
+mask_mag = generate_brain_mask(magn_vol, spatial_res, 0, mask_threshold_factor, ...
     mask_method, bet_fractional_threshold, bet_vertical_gradient);
+phase_mask_info = struct('used', false, 'threshold_rad', NaN, 'keep_fraction', NaN, 'method', 'disabled');
+mask_phase = true(size(mask_mag));
+if use_phase_quality_mask
+    [mask_phase, phase_mask_info] = generate_phase_quality_mask( ...
+        phase_meta.fit_residual, phase_meta.fit_residual_kind, mask_mag, phase_residual_percentile, ...
+        phase_residual_mad_factor, phase_residual_max_rad, phase_relative_residual_max, phase_quality_min_keep_fraction);
+end
+% QSMxT-like two-pass seed mask: create an unfilled strict mask by thresholding
+% a low-SNR-sensitive magnitude image (prefer the last echo in multi-echo GRE),
+% then use hole filling to form the broad/filled mask for pass-2.
+[twopass_seed_mask, twopass_info] = generate_two_pass_seed_mask(mag_meta, mask_mag, spatial_res, two_pass_mask_use_last_echo, two_pass_mask_otsu_factor, two_pass_mask_shell_mm, use_two_pass_qsm);
+mask_reliable_raw = logical(mask_mag) & logical(mask_phase) & logical(twopass_seed_mask);   % holes kept: pass-1
+mask_reliable_raw = largest_component(mask_reliable_raw);
+mask_bfr = imfill_safe(mask_reliable_raw);                     % holes filled: for BFR and pass-2
+mask_bfr = largest_component(mask_bfr);
+mask = mask_reliable_raw;
 voxel_volume_ml = prod(spatial_res) / 1000;
-fprintf('  Brain mask: %d voxels (%.2f%% of volume, %.1f mL)\n', ...
-    nnz(mask), 100*nnz(mask)/numel(mask), nnz(mask)*voxel_volume_ml);
+fprintf('  Mask volumes: magnitude=%d (%.1f mL), phase-quality=%d, two-pass-seed=%d, reliableRaw=%d, BFR=%d\n', ...
+    nnz(mask_mag), nnz(mask_mag)*voxel_volume_ml, nnz(mask_phase), nnz(twopass_seed_mask), nnz(mask_reliable_raw), nnz(mask_bfr));
+if phase_mask_info.used
+    if isfield(phase_mask_info,'residual_kind') && strcmpi(phase_mask_info.residual_kind,'relative')
+        fprintf('  Phase-quality threshold: %.4g relative residual, keep=%.1f%% of magnitude mask (%s)\n', ...
+            phase_mask_info.threshold, 100*phase_mask_info.keep_fraction, phase_mask_info.method);
+    else
+        fprintf('  Phase-quality threshold: %.4g rad residual, keep=%.1f%% of magnitude mask (%s)\n', ...
+            phase_mask_info.threshold, 100*phase_mask_info.keep_fraction, phase_mask_info.method);
+    end
+end
+if twopass_info.used
+    fprintf('  Two-pass seed threshold: %.4g (norm. magnitude), keep=%.1f%% of magnitude mask, shell=%.1f%% (%s)\n', ...
+        twopass_info.threshold, 100*twopass_info.keep_fraction, 100*twopass_info.shell_fraction, twopass_info.method);
+end
 
-fieldmap_Hz(~mask) = 0;
-fieldmap_ppm(~mask) = 0;
+% Preserve the broad (filled) support for subsequent BFR / pass-2. The strict
+% mask with holes is stored separately and should not zero the total field here.
+fieldmap_Hz(~mask_bfr) = 0;
+fieldmap_ppm(~mask_bfr) = 0;
 phase_last = phase_meta.phase_unwrapped_4d(:,:,:,end);
-phase_last(~mask) = 0;
+phase_last(~mask_bfr) = 0;
 
 TE_sec = phase_meta.echo_times_ms(:).' / 1000;
 delta_TE = compute_delta_te(TE_sec);
@@ -189,12 +261,27 @@ data.phs_wrap          = wrap_to_pi(double(phase_meta.phase_rad_4d(:,:,:,end)));
 data.phase_rad_4d      = double(phase_meta.phase_rad_4d);
 data.phase_scaled_4d   = double(phase_meta.phase_scaled_4d);
 data.phase_fit_method  = phase_meta.fit_method;
-data.phase_fit_residual_rad = phase_meta.fit_residual_rad;
+data.phase_fit_residual = phase_meta.fit_residual;
+data.phase_fit_residual_kind = phase_meta.fit_residual_kind;
+data.phase_fit_residual_rad = phase_meta.fit_residual;  % compatibility alias (may be relative for NLFit)
 data.mask_method       = mask_method;
 data.mask_erode_mm     = mask_erode_mm;
 data.mask_threshold_factor = mask_threshold_factor;
 data.bet_fractional_threshold = bet_fractional_threshold;
 data.bet_vertical_gradient = bet_vertical_gradient;
+data.use_phase_quality_mask = use_phase_quality_mask;
+data.phase_residual_percentile = phase_residual_percentile;
+data.phase_residual_mad_factor = phase_residual_mad_factor;
+data.phase_residual_max_rad = phase_residual_max_rad;
+data.phase_quality_min_keep_fraction = phase_quality_min_keep_fraction;
+data.mask_magnitude_initial = logical(mask_mag);
+data.mask_phase_quality = logical(mask_phase);
+data.mask_two_pass_seed = logical(twopass_seed_mask);
+data.mask_reliable_raw = logical(mask_reliable_raw);
+data.Mask_BFR = logical(mask_bfr);
+data.mask_combined_before_erode = logical(mask_bfr);
+data.phase_quality_info = phase_mask_info;
+data.two_pass_mask_info = twopass_info;
 data.msk               = logical(mask);
 data.Mask              = logical(mask);
 data.magn              = double(magn_vol);
@@ -217,6 +304,16 @@ data.FieldStrength     = B0;
 data.MagneticFieldStrength = B0;
 data.B0_dir            = B0_dir;
 data.b0dir             = B0_dir;
+data.B0_dir_patient    = orient.patient_B0_dir;
+data.image_axis_patient = orient.image_axis_patient;
+data.row_dir_patient   = orient.row_dir_patient;
+data.col_dir_patient   = orient.col_dir_patient;
+data.slice_dir_patient = orient.slice_dir_patient;
+data.acquisition_plane = orient.acquisition_plane;
+data.display_dim_axial = orient.display_dim_axial;
+data.display_dim_coronal = orient.display_dim_coronal;
+data.display_dim_sagittal = orient.display_dim_sagittal;
+data.orientation_valid = orient.valid;
 data.Manufacturer      = char(safe_field_str(phase_series.info, 'Manufacturer', ''));
 data.patient_group     = subject.group;
 data.subject_name      = subject.name;
@@ -702,7 +799,13 @@ meta.phase_unwrapped_4d = phase_unwrapped_4d;
 meta.echo_times_ms = echo_times_ms(:).';
 meta.echo_numbers = echo_numbers(:).';
 meta.fit_method = fit_method;
-meta.fit_residual_rad = residual;
+meta.fit_residual = residual;
+if startsWith(fit_method, 'MEDI_Fit_ppm_complex')
+    meta.fit_residual_kind = 'relative';
+else
+    meta.fit_residual_kind = 'radian_rms';
+end
+meta.fit_residual_rad = residual;   % compatibility field name only
 meta.phase_conversion = conv;
 end
 
@@ -920,16 +1023,79 @@ if isnan(B0)
 end
 end
 
-function B0_dir = detect_B0_dir(info)
-% Full oblique handling is outside this project. We keep [0 0 1] but store it
-% explicitly so downstream SEPIA receives a defined direction.
+function orient = detect_orientation_info(info)
+% Derive image-axis directions in patient LPS coordinates from DICOM
+% ImageOrientationPatient. The returned image_axis_patient columns correspond to
+% MATLAB array dimensions [dim1(row), dim2(col), dim3(slice)].
+orient = struct();
+orient.valid = false;
+orient.patient_B0_dir = [0 0 1];
+orient.row_dir_patient = [1 0 0];
+orient.col_dir_patient = [0 1 0];
+orient.slice_dir_patient = [0 0 1];
+orient.image_axis_patient = eye(3);
+orient.acquisition_plane = 'UNKNOWN';
+orient.display_dim_axial = 3;
+orient.display_dim_coronal = 2;
+orient.display_dim_sagittal = 1;
+
+if isfield(info, 'ImageOrientationPatient') && isnumeric(info.ImageOrientationPatient) && numel(info.ImageOrientationPatient) >= 6
+    iop = double(info.ImageOrientationPatient(1:6));
+    row_dir = iop(1:3);
+    col_dir = iop(4:6);
+    if all(isfinite(row_dir)) && all(isfinite(col_dir)) && norm(row_dir) > 0 && norm(col_dir) > 0
+        row_dir = row_dir ./ norm(row_dir);
+        col_dir = col_dir ./ norm(col_dir);
+        slice_dir = cross(row_dir, col_dir);
+        if all(isfinite(slice_dir)) && norm(slice_dir) > 0
+            slice_dir = slice_dir ./ norm(slice_dir);
+            orient.valid = true;
+            orient.row_dir_patient = row_dir(:).';
+            orient.col_dir_patient = col_dir(:).';
+            orient.slice_dir_patient = slice_dir(:).';
+            % MATLAB array dimensions: dim1 = DICOM rows (column direction),
+            % dim2 = DICOM columns (row direction), dim3 = slice direction.
+            orient.image_axis_patient = [col_dir(:), row_dir(:), slice_dir(:)];
+            orient.display_dim_sagittal = choose_display_dim(orient.image_axis_patient, [1 0 0]);
+            orient.display_dim_coronal = choose_display_dim(orient.image_axis_patient, [0 1 0]);
+            orient.display_dim_axial = choose_display_dim(orient.image_axis_patient, [0 0 1]);
+            [~, idx] = max(abs(slice_dir));
+            switch idx
+                case 1, orient.acquisition_plane = 'SAGITTAL';
+                case 2, orient.acquisition_plane = 'CORONAL';
+                case 3, orient.acquisition_plane = 'AXIAL';
+            end
+        end
+    end
+end
+end
+
+function B0_dir = detect_B0_dir(info, orient)
+% B0_dir must be expressed in image-array coordinates because downstream
+% kernels operate in array k-space. If DICOM already carries B0_dir, respect
+% it. Otherwise map patient-space B0=[0 0 1] into image space via IOP.
 B0_dir = [0 0 1];
+if nargin < 2 || isempty(orient)
+    orient = detect_orientation_info(info);
+end
 if isfield(info, 'B0_dir') && isnumeric(info.B0_dir) && numel(info.B0_dir) >= 3
     tmp = double(info.B0_dir(1:3));
     if all(isfinite(tmp)) && norm(tmp) > 0
         B0_dir = tmp(:).' ./ norm(tmp);
+        return;
     end
 end
+if isstruct(orient) && isfield(orient,'valid') && orient.valid
+    tmp = orient.image_axis_patient' * orient.patient_B0_dir(:);
+    if all(isfinite(tmp)) && norm(tmp) > 0
+        B0_dir = tmp(:).' ./ norm(tmp);
+    end
+end
+end
+
+function dim = choose_display_dim(image_axis_patient, patient_axis)
+proj = abs(image_axis_patient' * patient_axis(:));
+[~, dim] = max(proj);
 end
 
 function spatial_res = get_spatial_res(info)
@@ -951,7 +1117,26 @@ end
 function pos = get_slice_position(info, default)
 pos = default;
 if isfield(info, 'ImagePositionPatient') && isnumeric(info.ImagePositionPatient) && numel(info.ImagePositionPatient) >= 3
-    pos = double(info.ImagePositionPatient(3));
+    ipp = double(info.ImagePositionPatient(1:3));
+    if isfield(info, 'ImageOrientationPatient') && isnumeric(info.ImageOrientationPatient) && numel(info.ImageOrientationPatient) >= 6
+        iop = double(info.ImageOrientationPatient(1:6));
+        row_dir = iop(1:3); col_dir = iop(4:6);
+        if all(isfinite(row_dir)) && all(isfinite(col_dir)) && norm(row_dir) > 0 && norm(col_dir) > 0
+            row_dir = row_dir ./ norm(row_dir);
+            col_dir = col_dir ./ norm(col_dir);
+            slice_dir = cross(row_dir, col_dir);
+            if all(isfinite(slice_dir)) && norm(slice_dir) > 0
+                slice_dir = slice_dir ./ norm(slice_dir);
+                pos = dot(ipp, slice_dir);
+            else
+                pos = ipp(3);
+            end
+        else
+            pos = ipp(3);
+        end
+    else
+        pos = ipp(3);
+    end
 elseif isfield(info, 'SliceLocation') && ~isempty(info.SliceLocation)
     pos = scalarize(info.SliceLocation);
 end
@@ -1152,6 +1337,151 @@ elseif mask_ml < 600
 end
 end
 
+function [mask_phase, info] = generate_phase_quality_mask(residual_map, residual_kind, mask_mag, pct_keep, mad_factor, abs_max_rad, rel_max, min_keep_fraction)
+% Build a reliable-phase mask from the multi-echo fit residual map.
+% For NLFit (MEDI Fit_ppm_complex), the returned relres is dimensionless and
+% should be treated as a relative residual (SEPIA commonly uses threshold 0.5).
+% For linear phase fitting, the residual is an RMS phase error in radians.
+mask_phase = true(size(mask_mag));
+info = struct('used', false, 'threshold', NaN, 'threshold_rad', NaN, 'threshold_rel', NaN, ...
+    'keep_fraction', NaN, 'method', 'disabled', 'residual_kind', residual_kind);
+if isempty(residual_map) || ~isequal(size(residual_map), size(mask_mag))
+    info.method = 'residual_unavailable_fallback_alltrue';
+    return;
+end
+res = double(residual_map);
+vals = res(mask_mag & isfinite(res));
+if isempty(vals)
+    info.method = 'residual_empty_fallback_alltrue';
+    return;
+end
+vals = vals(vals >= 0);
+if isempty(vals)
+    info.method = 'residual_negativeonly_fallback_alltrue';
+    return;
+end
+medv = median(vals);
+madv = median(abs(vals - medv));
+robust_sigma = 1.4826 * madv;
+thr_robust = medv + mad_factor * robust_sigma;
+thr_pct = prctile(vals, pct_keep);
+if strcmpi(residual_kind, 'relative')
+    thr = min([thr_robust, thr_pct, rel_max]);
+    if ~(isfinite(thr) && thr > 0), thr = min([thr_pct, rel_max]); end
+    kindTag = 'relative';
+else
+    thr = min([thr_robust, thr_pct, abs_max_rad]);
+    if ~(isfinite(thr) && thr > 0), thr = min([thr_pct, abs_max_rad]); end
+    kindTag = 'radian';
+end
+cand = mask_mag & isfinite(res) & (res <= thr);
+keep_frac = nnz(cand) / max(nnz(mask_mag), 1);
+if keep_frac < min_keep_fraction
+    if strcmpi(residual_kind, 'relative')
+        thr_relax = min([prctile(vals, 99.5), max(rel_max, prctile(vals, 99))]);
+    else
+        thr_relax = min([prctile(vals, 99.5), max(abs_max_rad, prctile(vals, 99))]);
+    end
+    cand = mask_mag & isfinite(res) & (res <= thr_relax);
+    keep_frac = nnz(cand) / max(nnz(mask_mag), 1);
+    thr = thr_relax;
+    method = ['relaxed_' kindTag '_threshold'];
+else
+    method = [kindTag '_threshold'];
+end
+cand = imfill_safe(cand);
+cand = largest_component(cand);
+if nnz(cand) < max(100, round(0.50 * nnz(mask_mag)))
+    cand = mask_mag;
+    keep_frac = 1.0;
+    method = 'phase_mask_too_small_fallback_to_magnitude';
+end
+mask_phase = logical(cand);
+info.used = true;
+info.threshold = thr;
+if strcmpi(residual_kind, 'relative')
+    info.threshold_rel = thr;
+else
+    info.threshold_rad = thr;
+end
+info.keep_fraction = keep_frac;
+info.method = method;
+end
+
+function [mask_seed, info] = generate_two_pass_seed_mask(mag_meta, mask_mag, spatial_res, use_last_echo, otsu_factor, shell_mm, enable_two_pass)
+% QSMxT-inspired threshold masking adapted to a single post-combination WH-QSM
+% inversion pipeline. QSMxT applies threshold masks per echo and then hole-
+% fills them for pass-2. Here, because we combine echoes before inversion, we
+% restrict the thresholding step to a boundary shell where late-echo dropout is
+% most informative; the deep core is preserved to avoid artificial central voids.
+mask_seed = true(size(mask_mag));
+info = struct('used', false, 'threshold', NaN, 'keep_fraction', NaN, 'shell_fraction', NaN, 'method', 'disabled');
+if ~enable_two_pass || ~isstruct(mag_meta) || ~isfield(mag_meta,'mag4d') || isempty(mag_meta.mag4d)
+    info.method = 'disabled_or_no_mag4d';
+    return;
+end
+mag4d = double(mag_meta.mag4d);
+mag4d(~isfinite(mag4d)) = 0;
+if ndims(mag4d) < 4 || size(mag4d,4) < 1
+    info.method = 'invalid_mag4d';
+    return;
+end
+if use_last_echo
+    src = mag4d(:,:,:,end);
+    methodTag = 'last_echo_otsu_shell';
+else
+    src = min(mag4d, [], 4);
+    methodTag = 'min_echo_otsu_shell';
+end
+% Shell-only thresholding: preserve interior, only cut holes near boundary.
+if shell_mm > 0
+    inner = erode_mask_mm(mask_mag, spatial_res, shell_mm);
+    shell = mask_mag & ~inner;
+else
+    shell = mask_mag;
+end
+vals = src(shell);
+vals = vals(isfinite(vals) & vals > 0);
+info.shell_fraction = nnz(shell) / max(nnz(mask_mag),1);
+if isempty(vals)
+    info.method = 'empty_shell_values_fallback_alltrue';
+    return;
+end
+p99 = prctile(vals, 99.5);
+if ~(isfinite(p99) && p99 > 0)
+    p99 = max(vals);
+end
+norm_img = src / max(p99, eps);
+norm_img = min(max(norm_img, 0), 1);
+try
+    otsu = graythresh(norm_img(shell));
+catch
+    otsu = prctile(norm_img(shell), 25);
+    methodTag = [methodTag '_percentile25fallback'];
+end
+thr = min(max(otsu_factor * otsu, 0), 1);
+mask_seed = mask_mag;
+mask_seed(shell) = norm_img(shell) > thr;
+mask_seed = largest_component(mask_seed);
+keep_frac = nnz(mask_seed) / max(nnz(mask_mag), 1);
+if keep_frac < 0.70
+    mask_seed = mask_mag;
+    mask_seed(shell) = norm_img(shell) > 0.5 * thr;
+    mask_seed = largest_component(mask_seed);
+    keep_frac = nnz(mask_seed) / max(nnz(mask_mag), 1);
+    methodTag = [methodTag '_relaxed'];
+end
+if nnz(mask_seed) < max(100, round(0.75 * nnz(mask_mag)))
+    mask_seed = mask_mag;
+    keep_frac = 1.0;
+    methodTag = 'seed_too_small_fallback_to_magnitude';
+end
+info.used = true;
+info.threshold = thr;
+info.keep_fraction = keep_frac;
+info.method = methodTag;
+end
+
 function [mask, info] = try_toolbox_bet_mask(magn, spatial_res, bet_f, bet_g)
 mask = [];
 info = '';
@@ -1308,6 +1638,19 @@ B0 = data.B0; %#ok<NASGU>
 B0_dir = data.B0_dir; %#ok<NASGU>
 phase_fit_method = data.phase_fit_method; %#ok<NASGU>
 phase_conversion = data.phase_conversion; %#ok<NASGU>
+acquisition_plane = data.acquisition_plane; %#ok<NASGU>
+display_dim_axial = data.display_dim_axial; %#ok<NASGU>
+display_dim_coronal = data.display_dim_coronal; %#ok<NASGU>
+display_dim_sagittal = data.display_dim_sagittal; %#ok<NASGU>
+image_axis_patient = data.image_axis_patient; %#ok<NASGU>
+mask_magnitude_initial = data.mask_magnitude_initial; %#ok<NASGU>
+mask_phase_quality = data.mask_phase_quality; %#ok<NASGU>
+mask_two_pass_seed = data.mask_two_pass_seed; %#ok<NASGU>
+mask_reliable_raw = data.mask_reliable_raw; %#ok<NASGU>
+Mask_BFR = data.Mask_BFR; %#ok<NASGU>
+mask_combined_before_erode = data.mask_combined_before_erode; %#ok<NASGU>
+phase_quality_info = data.phase_quality_info; %#ok<NASGU>
+two_pass_mask_info = data.two_pass_mask_info; %#ok<NASGU>
 
 save(fullfile(output_data_dir, 'phs_tissue.mat'), 'phs_tissue');
 save(fullfile(output_data_dir, 'phs_unwrap.mat'), 'phs_unwrap');
@@ -1323,6 +1666,12 @@ catch
 end
 save(fullfile(output_data_dir, 'msk.mat'), 'msk');
 save(fullfile(output_data_dir, 'Mask.mat'), 'Mask');
+save(fullfile(output_data_dir, 'mask_magnitude_initial.mat'), 'mask_magnitude_initial');
+save(fullfile(output_data_dir, 'mask_phase_quality.mat'), 'mask_phase_quality');
+save(fullfile(output_data_dir, 'mask_two_pass_seed.mat'), 'mask_two_pass_seed');
+save(fullfile(output_data_dir, 'mask_reliable_raw.mat'), 'mask_reliable_raw');
+save(fullfile(output_data_dir, 'Mask_BFR.mat'), 'Mask_BFR');
+save(fullfile(output_data_dir, 'mask_combined_before_erode.mat'), 'mask_combined_before_erode');
 save(fullfile(output_data_dir, 'magn.mat'), 'magn');
 save(fullfile(output_data_dir, 'magn_raw.mat'), 'magn_raw');
 save(fullfile(output_data_dir, 'mp_rage.mat'), 'mp_rage');
@@ -1332,7 +1681,10 @@ save(fullfile(output_data_dir, 'spatial_res.mat'), 'spatial_res');
 save(fullfile(output_data_dir, 'evaluation_mask.mat'), 'evaluation_mask');
 save(fullfile(output_data_dir, 'dicom_whqsm_metadata.mat'), ...
     'echo_times_ms', 'echo_times_sec', 'delta_TE', 'B0', 'B0_dir', ...
-    'phase_fit_method', 'phase_conversion');
+    'phase_fit_method', 'phase_conversion', 'acquisition_plane', ...
+    'display_dim_axial', 'display_dim_coronal', 'display_dim_sagittal', 'image_axis_patient', ...
+    'mask_magnitude_initial', 'mask_phase_quality', 'mask_two_pass_seed', 'mask_reliable_raw', 'Mask_BFR', ...
+    'mask_combined_before_erode', 'phase_quality_info', 'two_pass_mask_info');
 try
     save(fullfile(output_data_dir, 'data_full.mat'), 'data', '-v7.3');
 catch

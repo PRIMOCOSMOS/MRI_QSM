@@ -69,13 +69,25 @@ localField_ppm(~Mask) = 0;
 % 由 cfg.whqsm.do_bfr 控制(真实数据 pipeline 自动开启)。不改动反演本身。
 % -------------------------------------------------------------------------
 do_bfr = get_cfg_bool(cfg, {'whqsm','do_bfr'}, false);
+MaskStrict = Mask;
+MaskFilled = Mask;
 if do_bfr
     if exist('mod_field_preprocess','file') == 2
         try
             [localField_Hz, prepInfo] = mod_field_preprocess(data, Mask, cfg);
-            localField_Hz(~Mask) = 0;
+            if isfield(prepInfo,'mask_two_pass_strict') && isequal(size(prepInfo.mask_two_pass_strict), size(Mask))
+                MaskStrict = logical(prepInfo.mask_two_pass_strict);
+            elseif isfield(prepInfo,'mask_for_qsm') && isequal(size(prepInfo.mask_for_qsm), size(Mask))
+                MaskStrict = logical(prepInfo.mask_for_qsm);
+            end
+            if isfield(prepInfo,'mask_two_pass_filled') && isequal(size(prepInfo.mask_two_pass_filled), size(Mask))
+                MaskFilled = logical(prepInfo.mask_two_pass_filled);
+            elseif isfield(prepInfo,'mask_after_bfr') && isequal(size(prepInfo.mask_after_bfr), size(Mask))
+                MaskFilled = logical(prepInfo.mask_after_bfr);
+            end
+            localField_Hz(~MaskFilled) = 0;
             localField_ppm = localField_Hz ./ (resolve_gyro() * B0);
-            localField_ppm(~Mask) = 0;
+            localField_ppm(~MaskFilled) = 0;
             field_source = sprintf('%s -> BFR(%s)', field_source, prepInfo.bfr_method);
             info.field_preprocess = prepInfo; %#ok<STRNU>
         catch ME_bfr
@@ -88,7 +100,18 @@ if do_bfr
     end
 end
 
-if ~is_valid_volume(localField_Hz, Mask)
+% Default single-pass path uses the broad/fill mask to avoid holes in final
+% real-data outputs. The strict mask is only used when two-pass is enabled.
+useTwoPass = get_cfg_bool(cfg, {'whqsm','use_two_pass_qsm'}, false);
+if useTwoPass && nnz(MaskStrict) < nnz(MaskFilled)
+    Mask = MaskStrict;
+else
+    Mask = MaskFilled;
+end
+localField_Hz_single = localField_Hz; localField_Hz_single(~Mask) = 0;
+localField_ppm_single = localField_ppm; localField_ppm_single(~Mask) = 0;
+
+if ~is_valid_volume(localField_Hz_single, Mask)
     error('WH-QSM input field map is invalid or nearly all zero. Source=%s', field_source);
 end
 
@@ -109,25 +132,67 @@ else
     fprintf('Echo times         : %s ms\n', mat2str(TE_sec(:).' * 1000, 6));
     fprintf('delta_TE           : %.6g ms\n', delta_TE_sec * 1000);
 end
-print_stats('Input field Hz', localField_Hz, Mask);
-print_stats('Input field ppm', localField_ppm, Mask);
+print_stats('Input field Hz (strict mask)', localField_Hz_single, Mask);
+print_stats('Input field ppm (strict mask)', localField_ppm_single, Mask);
+if nnz(MaskFilled) > nnz(Mask)
+    print_stats('Input field Hz (filled mask)', localField_Hz, MaskFilled);
+end
 
 %% ------------------------------------------------------------------------
 % 优先委托给【Challenge 已验证】的 inversion_whqsm_stable(mod_dipole_inversion.m)。
-% 它输入 ppm 局部场, 内部做 remove_mask_mean + ppm->Hz + Challenge 验证过的
-% FANSI 参数。让真实数据走与 Challenge 完全相同的反演代码, 消除两套 pipeline 差异。
-% (本次反复排查发现: 真实数据 pipeline 的反演与 Challenge 不是同一套, 是问题来源。)
+% 在 real-data 中可选 two-pass：
+%   pass-1 用严格/有洞 mask 重建可靠与细微来源；
+%   pass-2 用填洞/更宽 mask 重建强源与 less-reliable 区域；
+%   最终用 pass-2 只填补 pass-1 的缺失区。
+% 这不替代 WH-QSM，而是把 WH-QSM 作为单次反演器调用两次，是一种 masking /
+% artefact-reduction strategy（QSMxT 思路），与 weak-harmonic 正则互补。
 % -------------------------------------------------------------------------
 useValidated = get_cfg_bool(cfg, {'whqsm','use_validated_inversion'}, true);
+useTwoPass = get_cfg_bool(cfg, {'whqsm','use_two_pass_qsm'}, false);
 if useValidated && exist('inversion_whqsm_stable','file')==2
     try
+        if useTwoPass && nnz(MaskFilled) > nnz(MaskStrict)
+            fprintf('\nWH-QSM: 启用 two-pass WH-QSM (strict + filled masks).\n');
+            [chi_strict, ok1, msg1] = run_validated_whqsm_once(localField_ppm_single, data, MaskStrict, voxel_size);
+            [chi_filled, ok2, msg2] = run_validated_whqsm_once(localField_ppm, data, MaskFilled, voxel_size);
+            if ok1 && ok2
+                chi = chi_strict;
+                fillRegion = MaskFilled & ~MaskStrict;
+                chi(fillRegion) = chi_filled(fillRegion);
+                finalMask = MaskFilled;
+                chi(~finalMask) = 0;
+                validate_qsm_or_error(chi, finalMask);
+                info.inversion_path = 'two-pass inversion_whqsm_stable (validated strict+filled)';
+                info.field_source = field_source;
+                info.B0 = B0; info.B0_dir = B0_dir; info.voxel_size = voxel_size;
+                info.matrix_size = N; info.final_mask = finalMask; info.finished_at = datestr(now,31);
+                info.two_pass = struct('enabled', true, 'strict_mask_voxels', nnz(MaskStrict), ...
+                    'filled_mask_voxels', nnz(MaskFilled), 'filled_only_voxels', nnz(fillRegion), ...
+                    'strict_msg', msg1, 'filled_msg', msg2);
+                print_stats('WH-QSM chi ppm (two-pass final)', chi, finalMask);
+                outMat = fullfile(cfg.resultDir, 'whqsm_result.mat');
+                Mask = finalMask; %#ok<NASGU>
+                save(outMat, 'chi', 'chi_strict', 'chi_filled', 'info', 'localField_Hz', 'localField_ppm', 'Mask', 'MaskStrict', 'MaskFilled', '-v7.3');
+                try
+                    niftiwrite(single(chi_strict), fullfile(cfg.resultDir, 'WHQSM_chi_strict.nii'));
+                    niftiwrite(single(chi_filled), fullfile(cfg.resultDir, 'WHQSM_chi_filled.nii'));
+                    niftiwrite(uint8(MaskStrict), fullfile(cfg.resultDir, 'WHQSM_mask_strict.nii'));
+                    niftiwrite(uint8(MaskFilled), fullfile(cfg.resultDir, 'WHQSM_mask_filled.nii'));
+                catch
+                end
+                return;
+            else
+                warning('two-pass validated WH-QSM 未完全成功，回退单次 strict pass. strict=%s | filled=%s', msg1, msg2);
+            end
+        end
+
         data_for_inv = data;
         data_for_inv.Mask = Mask;
         if ~isfield(data_for_inv,'magn') || isempty(data_for_inv.magn)
             data_for_inv.magn = get_magnitude(data, Mask);
         end
         fprintf('\nWH-QSM: 委托 Challenge 已验证的 inversion_whqsm_stable (ppm 输入)。\n');
-        chi = inversion_whqsm_stable(localField_ppm, data_for_inv, voxel_size);
+        chi = inversion_whqsm_stable(localField_ppm_single, data_for_inv, voxel_size);
         chi = double(squeeze(chi));
         if ndims(chi) > 3, chi = chi(:,:,:,1); end
         if isequal(size(chi), N) && is_valid_volume(chi, Mask)
@@ -136,10 +201,10 @@ if useValidated && exist('inversion_whqsm_stable','file')==2
             info.inversion_path = 'inversion_whqsm_stable (validated, shared with Challenge)';
             info.field_source = field_source;
             info.B0 = B0; info.B0_dir = B0_dir; info.voxel_size = voxel_size;
-            info.matrix_size = N; info.finished_at = datestr(now,31);
+            info.matrix_size = N; info.final_mask = Mask; info.finished_at = datestr(now,31);
             print_stats('WH-QSM chi ppm', chi, Mask);
             outMat = fullfile(cfg.resultDir, 'whqsm_result.mat');
-            save(outMat, 'chi', 'info', 'localField_Hz', 'localField_ppm', 'Mask', '-v7.3');
+            save(outMat, 'chi', 'info', 'localField_Hz_single', 'localField_ppm_single', 'Mask', '-v7.3');
             return;
         else
             warning('inversion_whqsm_stable 输出无效/尺寸不符, 回退到内置 SEPIA 调用。');
@@ -290,6 +355,7 @@ try
     info.finished_at = datestr(now, 31);
     info.algorParam = algorParam;
     info.header = header;
+    info.final_mask = Mask;
 
     print_stats('WH-QSM chi ppm', chi, Mask);
 
@@ -335,6 +401,32 @@ end
 fprintf('WH-QSM completed in %.2f sec.\n', info.runtime_sec);
 fprintf('============================================================\n\n');
 
+end
+
+%% =========================================================================
+function [chi_out, ok, msg] = run_validated_whqsm_once(localField_ppm_in, data, MaskIn, voxel_size)
+chi_out = [];
+ok = false;
+msg = 'not_run';
+try
+    data_for_inv = data;
+    data_for_inv.Mask = logical(MaskIn);
+    if ~isfield(data_for_inv,'magn') || isempty(data_for_inv.magn)
+        data_for_inv.magn = get_magnitude(data, data_for_inv.Mask);
+    end
+    chi_out = inversion_whqsm_stable(localField_ppm_in, data_for_inv, voxel_size);
+    chi_out = double(squeeze(chi_out));
+    if ndims(chi_out) > 3, chi_out = chi_out(:,:,:,1); end
+    chi_out(~data_for_inv.Mask) = 0;
+    if is_valid_volume(chi_out, data_for_inv.Mask)
+        ok = true;
+        msg = 'ok';
+    else
+        msg = 'invalid_output';
+    end
+catch ME
+    msg = ME.message;
+end
 end
 
 %% =========================================================================
@@ -656,3 +748,4 @@ end
 fprintf('%s: min=%.6g, p1=%.6g, median=%.6g, p99=%.6g, max=%.6g, std=%.6g\n', ...
     name, min(v), prctile(v,1), median(v), prctile(v,99), max(v), std(v));
 end
+

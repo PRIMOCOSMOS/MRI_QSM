@@ -54,6 +54,46 @@ P.betVerticalGradient = 0.0;
 P.maskErodeMm = 1.5;
 P.maskThresholdFactor = 0.12;
 
+% ====== Phase-quality mask（仅 real-data；不影响 Challenge 口径） ======
+% 依据 QSM 共识：brain extraction 后应结合 phase-quality map 剔除不可靠相位体素，
+% 再做背景场去除。这里使用多回波相位拟合残差 phase_fit_residual_rad 作为可靠性图：
+% 残差越大，说明该体素的跨TE相位演化越不符合模型（低SNR/血流/边缘/包裹残留等）。
+P.usePhaseQualityMask = true;
+% 质量阈值 = min(分位数阈值, median + MAD系数*MAD, 绝对上限)。
+P.phaseResidualPercentile = 97.5;
+P.phaseResidualMadFactor = 4.0;
+P.phaseResidualMaxRad = 0.35;
+% 对于 MEDI Fit_ppm_complex 输出的 relative residual，参考 SEPIA 常用阈值 0.5。
+P.phaseRelativeResidualMax = 0.50;
+% 若阈值过严导致保留体素太少，则自动放宽，至少保留基础brain mask的该比例。
+P.phaseQualityMinKeepFraction = 0.85;
+
+% ====== Boundary artifact suppression（仅 real-data） ======
+% 1) BFR 使用填洞后的 mask（避免背景场去除把洞内真实组织当背景消掉）；
+% 2) 偶极反演/报告使用 reintroduce-holes 的可靠相位 mask；
+% 3) 可选：在边界薄层内，利用高 R2* 排除低SNR/静脉/边缘异常体素；
+% 4) 可选：BFR 后再做轻度 edge peel，抑制边界残余背景场。
+P.useR2starEdgeRefine = true;
+P.r2starEdgeBandMm = 2.0;
+P.r2starEdgePercentile = 97.5;
+P.r2starEdgeAbsMaxHz = 80;
+P.postBfrErodeMm = 1.0;
+
+% ====== Two-pass QSM (real-data only) ======
+% QSMxT 文献: 用“有洞的严格 mask”与“填洞的宽松 mask”各做一次 QSM，
+% 再用宽松结果去填严格结果缺失区，可减少不可靠边界/强源引起的 streaking。
+% 这里不替换 WH-QSM，而是做 two-pass WH-QSM：两次反演都仍然使用同一个
+% FANSI weak-harmonic 反演器，只改变最终反演 mask。
+P.useTwoPassQSM = false;   % 默认关闭：当前数据 two-pass 未见根本收益，且 elderly 易引入洞。保留为可选诊断策略。
+% QSMxT 风格 two-pass 阈值: 对用于“有洞严格 mask”的质量图做 Otsu 阈值，再乘以
+% 一个系数。QSMxT 文档示例里 two-pass 常用 Otsu x1.3。
+P.twoPassMaskUseLastEcho = true;
+P.twoPassMaskOtsuFactor = 1.3;
+% 适配你的单次“先多回波拟合 field, 再单次 WH-QSM 反演”流程：
+% QSMxT 原文是逐回波 two-pass；这里为避免把晚回波的全脑低信号误当作 unreliable，
+% 仅在 brain boundary 附近薄层应用晚回波阈值来打洞，脑内核心区保留。
+P.twoPassMaskShellMm = 3.0;
+
 % ====== Susceptibility source separation / 磁化率分离 ======
 % 优先调用成熟工具箱：SNU-LIST chi-separation / 用户提供 batch adapter。
 % 如果没有 toolbox，默认只导出标准输入并跳过；如需预览，可打开 exploratory fallback。
@@ -167,10 +207,18 @@ P.whqsmTol = 1e-5;
 % 先跑 RUN_WHQSM_LAMBDA_SWEEP([3e-4 2e-4 1e-4 5e-5 2e-5])，按深部核团 ROI 的
 % p99 是否达到铁核量级(GP~0.10-0.18ppm)来选; 选定后填到这里并【重跑 WH-QSM】才生效
 % (现有 whqsm_*_complete.mat 是旧 lambda 的结果，不会自动更新)。
-P.whqsmLambda = 4e-4;     % 文献常用 1e-4~6e-4。注意: ADMM 的 mu1 会自动设为 100*lambda
-                          % (在 run_whqsm_comparison 内), 这是 FANSI 收敛的关键, 勿手改成 < lambda。
+P.whqsmLambda = 2e-4;     % 适度降低 real-data 正则化，增强深部核团对比；不影响 Challenge 固定口径。
+                          % 文献常用 1e-4~6e-4。注意: mu1 会随 validated inversion 保持兼容口径。
 P.whqsmBeta = 150;        % WH 谐波约束权重(文献 WH-QSM: 150~500)
 P.whqsmMuh = 10;          % WH 谐波一致性(文献: ~10; 之前误设 5)
+
+% ====== 3D render ======
+% MATLAB .fig 交互式三维渲染参数（可旋转/缩放/拖动）。
+P.render3DEnable = true;
+P.render3DReduceRatio = 0.20;    % reducepatch 比例，减小面数便于交互
+P.render3DQsmPosIso = 0.03;      % ppm
+P.render3DQsmNegIso = -0.03;     % ppm
+P.render3DChiSepIso = 0.03;      % ppm
 
 % 可视化窗位：窗口太宽也会让脑内"看起来淡"。3T 深部核团 χ 量级约 0.08~0.18 ppm，
 % 这里把 QSM 显示窗位收紧到 ±0.10，便于看清铁核对比（不影响数值，只影响显示）。

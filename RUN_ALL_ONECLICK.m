@@ -6,8 +6,9 @@ function RUN_ALL_ONECLICK(varargin)
 %   阶段 1  WH-QSM         : DICOM → 多回波相位拟合 → SEPIA/FANSI WH-QSM
 %   阶段 2  磁化率分离对比 : 深度学习 χ-sepnet (ONNX) vs 传统凸优化
 %   阶段 3  两被试配准比较 : 59 vs 72 (NORMAL vs ELDERLY) 配准后差异/统计
+%   阶段 4  3D 交互渲染    : WH-QSM total χ 与 χ-sep 的 3D 等值面(.fig)
 %
-% 默认从阶段 1 一路跑到阶段 3。也可只跑其中一段（见 'from'/'to' 参数），
+% 默认从阶段 1 一路跑到阶段 4。也可只跑其中一段（见 'from'/'to' 参数），
 % 因此当你手头已有预处理数据 (whqsm_*_complete.mat) 时，可直接从阶段 2 开始，
 % 无需重跑 DICOM/WH-QSM。
 %
@@ -27,14 +28,14 @@ function RUN_ALL_ONECLICK(varargin)
 % ---- parse args ----
 p = inputParser;
 addParameter(p, 'from', 'whqsm', @(x) ischar(x) || isstring(x));
-addParameter(p, 'to',   'compare', @(x) ischar(x) || isstring(x));
+addParameter(p, 'to',   'render', @(x) ischar(x) || isstring(x));
 addParameter(p, 'subject', 'all', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
 fromStage = lower(char(p.Results.from));
 toStage   = lower(char(p.Results.to));
 subject   = char(p.Results.subject);
 
-order = {'whqsm','chisep','compare'};
+order = {'whqsm','chisep','compare','render'};
 iFrom = stage_index(order, fromStage);
 iTo   = stage_index(order, toStage);
 if iFrom > iTo
@@ -71,10 +72,18 @@ end
 
 % ---- 阶段 3: 两被试配准比较 ----
 if in_range(order, 'compare', iFrom, iTo)
-    fprintf('\n########## 阶段 3/3: 两被试配准比较 (59 vs 72) ##########\n');
+    fprintf('\n########## 阶段 3/4: 两被试配准比较 (59 vs 72) ##########\n');
     safe_run(@() RUN_TWO_SUBJECT_COMPARE(), '两被试配准比较');
 else
     fprintf('\n[跳过 阶段 3: 两被试配准比较]\n');
+end
+
+% ---- 阶段 4: 3D 交互渲染 ----
+if in_range(order, 'render', iFrom, iTo)
+    fprintf('\n########## 阶段 4/4: 3D 交互渲染 ##########\n');
+    safe_run(@() RUN_QSM_3D_RENDER(subject), '3D交互渲染');
+else
+    fprintf('\n[跳过 阶段 4: 3D 交互渲染]\n');
 end
 
 fprintf('\n============================================================\n');
@@ -114,6 +123,6 @@ function banner()
 fprintf('\n');
 fprintf('╔══════════════════════════════════════════════════════════════╗\n');
 fprintf('║  MRI_QSM 总入口  RUN_ALL_ONECLICK                          ║\n');
-fprintf('║  WH-QSM → 磁化率分离(DL vs 优化) → 两被试配准比较          ║\n');
+fprintf('║  WH-QSM → χ-sep(DL vs 优化) → 配准比较 → 3D交互渲染        ║\n');
 fprintf('╚══════════════════════════════════════════════════════════════╝\n');
 end

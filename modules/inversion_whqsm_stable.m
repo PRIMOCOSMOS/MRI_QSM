@@ -162,27 +162,34 @@ else
 end
 niftiwrite(single(mag), magFile);
 
+if isfield(data,'B0_dir') && ~isempty(data.B0_dir)
+    B0_dir = double(data.B0_dir(:).');
+    if ~(all(isfinite(B0_dir)) && norm(B0_dir) > 0), B0_dir = [0 0 1]; end
+    B0_dir = B0_dir ./ max(norm(B0_dir), eps);
+else
+    B0_dir = [0 0 1];
+end
+
+[TE, delta_TE] = get_te_for_header(data);
+
 header = struct();
 header.matrixSize = matrixSize;
 header.matrix_size = matrixSize;
 header.voxelSize = voxel_size;
 header.voxel_size = voxel_size;
-header.b0dir = [0 0 1];
-header.B0_dir = [0 0 1];
+header.b0dir = B0_dir;
+header.B0_dir = B0_dir;
 header.b0 = B0;
 header.B0 = B0;
-header.TE = 0.025;
-header.delta_TE = 0.025;
+header.TE = TE;
+header.delta_TE = delta_TE;
 header.CF = B0 * gyro;
 
 matrix_size = matrixSize; %#ok<NASGU>
 voxelSize = voxel_size; %#ok<NASGU>
 voxel_size_ = voxel_size; %#ok<NASGU>
-B0_dir = [0 0 1]; %#ok<NASGU>
-b0dir = [0 0 1]; %#ok<NASGU>
+b0dir = B0_dir; %#ok<NASGU>
 b0 = B0; %#ok<NASGU>
-TE = 0.025; %#ok<NASGU>
-delta_TE = 0.025; %#ok<NASGU>
 CF = B0 * gyro; %#ok<NASGU>
 
 save(headerFile, ...
@@ -444,6 +451,48 @@ if bestScore > 0
     qsmPath = bestPath;
 end
 
+end
+
+function [TE, delta_TE] = get_te_for_header(data)
+% Use real multi-echo timing when available. This keeps SEPIA header
+% consistent with the actual acquisition. For legacy Challenge-style inputs
+% where no TE info is stored, fall back to 25 ms to preserve old behaviour.
+TE = 0.025;
+delta_TE = 0.025;
+try
+    if isfield(data, 'echo_times_sec') && ~isempty(data.echo_times_sec)
+        t = double(data.echo_times_sec(:).');
+    elseif isfield(data, 'TE') && ~isempty(data.TE)
+        t = double(data.TE(:).');
+    elseif isfield(data, 'EchoTime') && ~isempty(data.EchoTime)
+        t = double(data.EchoTime(:).') / 1000;
+    elseif isfield(data, 'echo_times_ms') && ~isempty(data.echo_times_ms)
+        t = double(data.echo_times_ms(:).') / 1000;
+    else
+        t = [];
+    end
+    t = t(isfinite(t) & t > 0);
+    if ~isempty(t)
+        TE = unique(t);
+        if numel(TE) >= 2
+            d = diff(sort(TE));
+            d = d(isfinite(d) & d > 0);
+            if ~isempty(d), delta_TE = median(d); end
+        else
+            if isfield(data, 'delta_TE') && ~isempty(data.delta_TE)
+                delta_TE = double(data.delta_TE(1));
+            elseif isfield(data, 'delta_TE_sec') && ~isempty(data.delta_TE_sec)
+                delta_TE = double(data.delta_TE_sec(1));
+            else
+                delta_TE = TE(1);
+            end
+        end
+    end
+catch
+end
+if ~(isnumeric(delta_TE) && isfinite(delta_TE) && delta_TE > 0)
+    delta_TE = 0.025;
+end
 end
 
 function names = list_nifti_files(rootDir)

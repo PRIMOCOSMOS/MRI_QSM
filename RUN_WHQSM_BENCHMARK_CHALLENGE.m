@@ -107,10 +107,10 @@ catch ME
     simple_metrics(all_results, names, chi_cosmos, Mask);
 end
 
-% --- ROI 苍白球(用 chi_cosmos 高值定位, 公平) ---
-fprintf('\n========== 苍白球 ROI (用 COSMOS 高值定位) median 对比 ==========\n');
+% --- 深部高 χ ROI（COSMOS top2% 高值区；不是解剖学严格 GP 掩膜）---
+fprintf('\n========== 深部高-χ ROI (COSMOS top2%% 高值区) median 对比 ==========\n');
 gp = (chi_cosmos > prctile(chi_cosmos(Mask),98)) & Mask;
-fprintf('  COSMOS  苍白球 median=%.4f\n', median(chi_cosmos(gp)));
+fprintf('  COSMOS  high-χ ROI median=%.4f\n', median(chi_cosmos(gp)));
 for i=1:numel(results)
     fprintf('  %-16s median=%.4f (与COSMOS比 %.0f%%)\n', names{i}, ...
         median(results{i}(gp)), median(results{i}(gp))/median(chi_cosmos(gp))*100);
@@ -119,7 +119,8 @@ end
 fprintf('\n判读:\n');
 fprintf('  - WH-QSM 的 RMSE/SSIM 若与 TKD/L2 同级或更好 -> 你的实现正常;\n');
 fprintf('  - StdRatio/Slope 接近 1 -> 无过度正则化; 明显<1 -> 对比被压(可调小正则);\n');
-fprintf('  - 苍白球 median 与 COSMOS 接近 -> 数值准确, 视觉差异主要是单向QSM固有特性。\n');
+fprintf('  - 这里的 ROI 是 COSMOS 高值区 proxy，不等同于解剖学严格苍白球；\n');
+fprintf('    real-data 若要与 Challenge 严格比 GP，需共用同一解剖 ROI 定义。\n');
 fprintf('结果保存: %s\n', cfg.resultDir);
 end
 

@@ -102,7 +102,7 @@ if numel(keys) >= 2
 end
 
 % ---- comparison figure ----
-make_compare_figure(res, Mask, outDir);
+make_compare_figure(res, Mask, data, outDir);
 
 % optional ROI table
 roiT = try_roi_table(cfg, res, Mask);
@@ -136,21 +136,23 @@ if nnz(ok)<10, r=NaN; return; end
 c = corrcoef(a(ok),b(ok)); r=c(1,2);
 end
 
-function make_compare_figure(res, Mask, outDir)
+function make_compare_figure(res, Mask, data, outDir)
 keys = fieldnames(res);
-[~,sz] = max(squeeze(sum(sum(Mask,1),2)));
+axDim = get_display_dim(data, 'axial', 3);
+axIdx = center_index_along_dim(Mask, axDim);
 nM = numel(keys);
 fig = figure('Color','w','Position',[40 40 520*nM 700]);
 tiledlayout(2, nM, 'Padding','compact','TileSpacing','compact');
-cpara=[0 0.15]; cdia=[0 0.15];   % χpara/|χdia| 多在 0-0.15ppm; 原 0-0.20 偏宽显淡
+cpara=[0 0.15]; cdia=[0 0.15];
 for r = 1:2
     for i = 1:nM
         nexttile;
         R = res.(keys{i});
         if r==1, img = R.chi_para; ttl=sprintf('%s  \\chi_{para}',keys{i}); cl=cpara;
         else,    img = abs(R.chi_dia); ttl=sprintf('%s  |\\chi_{dia}|',keys{i}); cl=cdia; end
-        showimg(img(:,:,sz), Mask(:,:,sz), cl);
-        title(ttl,'Interpreter','tex');
+        [sl, msk] = extract_dim_slice(img, Mask, axDim, axIdx);
+        showimg(sl, msk, cl);
+        title(sprintf('%s (axial dim%d=%d)', ttl, axDim, axIdx),'Interpreter','tex');
     end
 end
 sgtitle('χ-separation method comparison (para top, |dia| bottom)');
@@ -205,4 +207,42 @@ isOnnx = @(m) any(strcmpi(m, {'onnx','dl','chisepnet','deep'}));
 onnxM = methods(cellfun(isOnnx, methods));
 other = methods(~cellfun(isOnnx, methods));
 out = [onnxM(:); other(:)]';
+end
+
+function dim = get_display_dim(data, planeName, fallback)
+fld = ['display_dim_' lower(char(planeName))];
+if isstruct(data) && isfield(data, fld) && ~isempty(data.(fld))
+    dim = double(data.(fld));
+else
+    dim = fallback;
+end
+if ~(isscalar(dim) && isfinite(dim) && dim>=1 && dim<=3)
+    dim = fallback;
+end
+end
+
+function idx0 = center_index_along_dim(mask, dim)
+idx = find(mask);
+if isempty(idx)
+    N = size(mask); idx0 = round(N(dim)/2); return;
+end
+[sub{1:3}] = ind2sub(size(mask), idx); %#ok<AGROW>
+v = sub{dim};
+idx0 = round(mean(v));
+N = size(mask); idx0 = max(1, min(N(dim), idx0));
+end
+
+function [img, msk] = extract_dim_slice(vol, mask, dim, idx)
+idx = round(idx);
+switch dim
+    case 1
+        img = squeeze(vol(idx,:,:));
+        msk = squeeze(mask(idx,:,:));
+    case 2
+        img = squeeze(vol(:,idx,:));
+        msk = squeeze(mask(:,idx,:));
+    otherwise
+        img = squeeze(vol(:,:,idx));
+        msk = squeeze(mask(:,:,idx));
+end
 end
